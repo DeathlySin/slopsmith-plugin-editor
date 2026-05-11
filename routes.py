@@ -21,6 +21,12 @@ from fastapi.responses import FileResponse, JSONResponse
 import yaml
 
 
+# Matches a plausible 4-digit album year inside free-form text — used to
+# sanitize <albumYear> when it has been polluted by copyright strings from
+# GP imports (RsCli parses albumYear as Int32 and rejects anything else).
+_YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
+
+
 _sessions = None
 
 
@@ -1528,7 +1534,14 @@ def setup(app, context):
 
     @app.post("/api/plugins/editor/build")
     async def build_cdlc_endpoint(data: dict):
-        """Build a complete CDLC .psarc from the current create-mode session."""
+        """Build a CDLC from the current create-mode session.
+
+        Writes a `.sloppak` when any arrangement uses extended-range strings
+        (7/8-string guitar or 5/6-string bass) — RS2014's SNG binary format
+        is hard-locked to 6/4 strings, so a regular PSARC build via RsCli
+        would crash inside `ConvertInstrumental.xmlToSng`. Falls back to the
+        normal PSARC build otherwise.
+        """
         from lib.cdlc_builder import build_cdlc
 
         session_id = data.get("session_id", "")
@@ -1543,6 +1556,20 @@ def setup(app, context):
         meta = data.get("metadata", session.get("metadata", {}))
         audio_url = data.get("audio_url", "")
         art_path = data.get("art_path", "")
+
+        def _is_extended_range(arr):
+            is_bass = "bass" in (arr.get("name", "") or "").lower()
+            max_string = 3 if is_bass else 5
+            for n in arr.get("notes", []) or []:
+                if int(n.get("string", 0)) > max_string:
+                    return True
+            for ch in arr.get("chords", []) or []:
+                for cn in ch.get("notes", []) or []:
+                    if int(cn.get("string", 0)) > max_string:
+                        return True
+            return False
+
+        needs_sloppak = any(_is_extended_range(a) for a in arrangements_data)
 
         def _build():
             # Write each arrangement's data to its corresponding XML
@@ -1612,16 +1639,136 @@ def setup(app, context):
                 album_art_path=art_path if art_path and Path(art_path).exists() else "",
             )
 
+        def _build_sloppak_extended():
+            """Build a .sloppak for extended-range charts (>6 guitar / >4 bass)."""
+            resolved = _resolve_storage_url(audio_url) if audio_url else None
+            audio_file = str(resolved) if resolved else ""
+            if not audio_file or not Path(audio_file).exists():
+                raise RuntimeError("No audio file available for build")
+
+            dlc_dir = get_dlc_dir()
+            if not dlc_dir:
+                raise RuntimeError("DLC folder not configured")
+
+            title = meta.get("title", "Untitled")
+            artist = meta.get("artistName") or meta.get("artist", "Unknown")
+            album = meta.get("albumName") or meta.get("album", "")
+            year_raw = str(meta.get("albumYear") or meta.get("year", ""))
+            ym = _YEAR_RE.search(year_raw) if year_raw else None
+            year = int(ym.group(1)) if ym else 0
+            safe_t = re.sub(r'[<>:"/\\|?*]', '_', title)
+            safe_a = re.sub(r'[<>:"/\\|?*]', '_', artist)
+
+            # Build the sloppak in a temp staging dir, then zip into DLC dir.
+            staging = Path(tempfile.mkdtemp(prefix="slopsmith_sloppak_build_"))
+            try:
+                arr_dir = staging / "arrangements"
+                arr_dir.mkdir()
+                stems_dir = staging / "stems"
+                stems_dir.mkdir()
+
+                # Single combined-audio stem — the editor only has one audio
+                # source per create-mode session.
+                audio_ext = Path(audio_file).suffix.lower() or ".ogg"
+                stem_filename = f"audio{audio_ext}"
+                shutil.copy2(audio_file, stems_dir / stem_filename)
+
+                used_ids: set[str] = set()
+                manifest_arrangements = []
+                duration = 0.0
+                for b in beats:
+                    try:
+                        duration = max(duration, float(b.get("time", 0)))
+                    except (TypeError, ValueError):
+                        pass
+
+                for i, ad in enumerate(arrangements_data):
+                    name = ad.get("name", f"Arr{i}")
+                    aid = _arrangement_id(name, used_ids)
+                    used_ids.add(aid)
+                    wire = _arr_dict_to_wire(
+                        name,
+                        ad.get("tuning", [0] * 6),
+                        int(ad.get("capo", 0)),
+                        ad.get("notes", []),
+                        ad.get("chords", []),
+                        ad.get("chord_templates", []),
+                    )
+                    if i == 0:
+                        wire["beats"] = [
+                            {"time": round(float(b.get("time", 0)), 3),
+                             "measure": int(b.get("measure", -1))}
+                            for b in beats
+                        ]
+                        wire["sections"] = [
+                            {"name": s.get("name", ""),
+                             "number": int(s.get("number", 0)),
+                             "time": round(float(s.get("start_time", 0)), 3)}
+                            for s in sections
+                        ]
+                    (arr_dir / f"{aid}.json").write_text(
+                        json.dumps(wire, separators=(",", ":")),
+                        encoding="utf-8",
+                    )
+                    manifest_arrangements.append({
+                        "id": aid,
+                        "name": name,
+                        "file": f"arrangements/{aid}.json",
+                        "tuning": list(ad.get("tuning", [0] * 6)),
+                        "capo": int(ad.get("capo", 0)),
+                    })
+
+                manifest = {
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "duration": round(duration, 3),
+                    "stems": [
+                        {"id": "audio", "file": f"stems/{stem_filename}", "default": "on"},
+                    ],
+                    "arrangements": manifest_arrangements,
+                }
+                if year:
+                    manifest["year"] = year
+
+                if art_path and Path(art_path).exists():
+                    cover_ext = Path(art_path).suffix.lower() or ".jpg"
+                    cover_name = f"cover{cover_ext}"
+                    shutil.copy2(art_path, staging / cover_name)
+                    manifest["cover"] = cover_name
+
+                (staging / "manifest.yaml").write_text(
+                    yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True),
+                    encoding="utf-8",
+                )
+
+                output = dlc_dir / f"{safe_t}_{safe_a}_p.sloppak"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                tmp_zip = output.with_suffix(output.suffix + ".tmp")
+                with zipfile.ZipFile(str(tmp_zip), "w", zipfile.ZIP_DEFLATED) as zf:
+                    for f in staging.rglob("*"):
+                        if f.is_file():
+                            zf.write(f, f.relative_to(staging).as_posix())
+                tmp_zip.replace(output)
+                return str(output)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+
         try:
+            target = _build_sloppak_extended if needs_sloppak else _build
             output_path = await asyncio.get_event_loop().run_in_executor(
-                None, _build
+                None, target
             )
         except Exception as e:
             import traceback
             traceback.print_exc()
             return JSONResponse({"error": str(e)}, 500)
 
-        return {"success": True, "path": output_path}
+        return {
+            "success": True,
+            "path": output_path,
+            "format": "sloppak" if needs_sloppak else "psarc",
+        }
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -1790,10 +1937,36 @@ def setup(app, context):
         """Build a Rocksmith arrangement XML from editor data."""
         root = ET.Element("song", version="7")
 
-        # Preserve metadata from original XML, override with editor metadata
+        # Friendly key aliases the editor uses in its session metadata, mapped
+        # onto the RS XML tag names. Lets convert-gp's `{title, artist, album,
+        # year}` payload override the original XML even though the XML uses
+        # `albumName` / `albumYear` / `artistName`.
+        _META_ALIASES = {
+            "title": ("title",),
+            "artistName": ("artistName", "artist"),
+            "albumName": ("albumName", "album"),
+            "albumYear": ("albumYear", "year"),
+            "arrangement": ("arrangement",),
+            "offset": ("offset",),
+            "songLength": ("songLength",),
+            "startBeat": ("startBeat",),
+            "averageTempo": ("averageTempo",),
+        }
+
         def _text(tag, fallback=""):
+            for k in _META_ALIASES.get(tag, (tag,)):
+                if k in metadata and metadata[k] not in (None, ""):
+                    return str(metadata[k])
             el = old_root.find(tag)
-            return metadata.get(tag, el.text if el is not None and el.text else fallback)
+            return el.text if el is not None and el.text else fallback
+
+        # albumYear must parse as Int32 for RsCli; sanitize away any stray
+        # copyright text that earlier conversions may have written into the
+        # XML, and clamp non-numeric values to empty.
+        def _year_text():
+            raw = _text("albumYear", "")
+            m = _YEAR_RE.search(raw) if raw else None
+            return m.group(1) if m else ""
 
         ET.SubElement(root, "title").text = _text("title", "Untitled")
         ET.SubElement(root, "arrangement").text = _text("arrangement", "Lead")
@@ -1803,12 +1976,20 @@ def setup(app, context):
         ET.SubElement(root, "averageTempo").text = _text("averageTempo", "120")
         ET.SubElement(root, "artistName").text = _text("artistName", "Unknown")
         ET.SubElement(root, "albumName").text = _text("albumName", "")
-        ET.SubElement(root, "albumYear").text = _text("albumYear", "")
+        ET.SubElement(root, "albumYear").text = _year_text()
 
-        # Tuning — preserve from original
+        # Tuning — preserve from original. RS schema names string0..string5;
+        # extended-range arrangements (7/8-string guitar imported from GP)
+        # carry string6/string7 too, so copy whatever the source XML had.
         old_tuning = old_root.find("tuning")
         tuning_el = ET.SubElement(root, "tuning")
-        for i in range(6):
+        max_i = 5
+        if old_tuning is not None:
+            i = 6
+            while old_tuning.get(f"string{i}") is not None:
+                max_i = i
+                i += 1
+        for i in range(max_i + 1):
             val = "0"
             if old_tuning is not None:
                 val = old_tuning.get(f"string{i}", "0")
@@ -1860,11 +2041,15 @@ def setup(app, context):
         ct_el = ET.SubElement(
             root, "chordTemplates", count=str(len(chord_templates))
         )
+        ct_width = max(
+            6,
+            max((len(ct.get("frets", [])) for ct in chord_templates), default=6),
+        )
         for ct in chord_templates:
             attrs = {"chordName": ct.get("name", "")}
-            frets = ct.get("frets", [-1] * 6)
-            fingers = ct.get("fingers", [-1] * 6)
-            for i in range(6):
+            frets = ct.get("frets", [-1] * ct_width)
+            fingers = ct.get("fingers", [-1] * ct_width)
+            for i in range(ct_width):
                 attrs[f"fret{i}"] = str(frets[i] if i < len(frets) else -1)
                 attrs[f"finger{i}"] = str(fingers[i] if i < len(fingers) else -1)
             ET.SubElement(ct_el, "chordTemplate", **attrs)

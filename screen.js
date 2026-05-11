@@ -7,20 +7,24 @@
 // Constants
 // ════════════════════════════════════════════════════════════════════
 
+// Highway colors palette. STRING_COLORS is indexed *by lane*, not by string —
+// lane 0 is the top (highest-pitched) lane, lane N-1 is the bottom (lowest).
+// For 7/8-string guitar the extra low strings push the standard 6 colors up,
+// so we add fresh colors at the bottom of the palette (lane indices 6, 7).
 const STRING_COLORS = [
-    '#FC3A51', // 0 low E — red
-    '#FFC600', // 1 A     — yellow
-    '#3FAAFF', // 2 D     — blue
-    '#FF8A00', // 3 G     — orange
-    '#58D263', // 4 B     — green
-    '#C473FF', // 5 high e — purple
+    '#FC3A51', // top lane (highest string)  — red
+    '#FFC600',
+    '#3FAAFF',
+    '#FF8A00',
+    '#58D263',
+    '#C473FF',
+    '#E07A8A', // 7th lane (7-string low B)  — dusty pink
+    '#8AA0B8', // 8th lane (8-string low F#) — steel blue
 ];
-// Display: lane 0 = high e (top), lane 5 = low E (bottom)
-const LANE_LABELS = ['e', 'B', 'G', 'D', 'A', 'E'];
 
 let WAVEFORM_H = 70;
 let LANE_H = 44;
-const LANES = 6;
+const MAX_LANES = 8;
 let BEAT_H = 24;
 const LABEL_W = 52;
 const MIN_NOTE_W = 18;
@@ -90,17 +94,66 @@ let rafId = null;
 // Coordinate mapping
 // ════════════════════════════════════════════════════════════════════
 
+function isBassArr() {
+    if (!S.arrangements.length) return false;
+    const arr = S.arrangements[S.currentArr];
+    return !!arr && /bass/i.test(arr.name || '');
+}
+
+// Active arrangement string count. Mirrors lib/song.py:arrangement_string_count
+// so the editor agrees with the highway: combine name-based default (Bass→4,
+// else→6), tuning length when ≠6 (length 6 is RS-schema padding), and the
+// max note-string index. Clamped to [4, MAX_LANES].
+function lanes() {
+    if (!S.arrangements.length) return 6;
+    const arr = S.arrangements[S.currentArr];
+    if (!arr) return 6;
+    let n = isBassArr() ? 4 : 6;
+    const tuningLen = Array.isArray(arr.tuning) ? arr.tuning.length : 6;
+    if (tuningLen !== 6) n = Math.max(n, tuningLen);
+    for (const note of arr.notes || []) {
+        if (note.string + 1 > n) n = note.string + 1;
+    }
+    for (const ch of arr.chords || []) {
+        for (const cn of ch.notes || []) {
+            if (cn.string + 1 > n) n = cn.string + 1;
+        }
+    }
+    return Math.max(4, Math.min(MAX_LANES, n));
+}
+// Build display labels in RS string-index order (low → high). Extended-range
+// instruments add strings at the low end (7-string guitar adds low B below
+// low E; 5-string bass adds low B below low E), and 6-string bass adds high
+// C on top. The arrow notation marks those non-standard strings.
+function laneLabels() {
+    const L = lanes();
+    if (isBassArr()) {
+        // 4-string standard: E A D G
+        // 5-string: B↓ E A D G  (low B added)
+        // 6-string: B↓ E A D G C (low B + high C added)
+        if (L <= 4) return ['E', 'A', 'D', 'G'].slice(0, L);
+        if (L === 5) return ['B↓', 'E', 'A', 'D', 'G'];
+        return ['B↓', 'E', 'A', 'D', 'G', 'C↑'].slice(0, L);
+    }
+    // Guitar standard: E A D G B e (low → high)
+    // 7-string: B↓ E A D G B e  (low B added)
+    // 8-string: F#↓ B↓ E A D G B e (low F# and low B added)
+    if (L <= 6) return ['E', 'A', 'D', 'G', 'B', 'e'].slice(0, L);
+    if (L === 7) return ['B↓', 'E', 'A', 'D', 'G', 'B', 'e'];
+    return ['F#↓', 'B↓', 'E', 'A', 'D', 'G', 'B', 'e'].slice(0, L);
+}
+
 function timeToX(t)  { return LABEL_W + (t - S.scrollX) * S.zoom; }
 function xToTime(x)  { return (x - LABEL_W) / S.zoom + S.scrollX; }
 function laneToY(l)  { return WAVEFORM_H + l * LANE_H; }
 function yToLane(y)  { return Math.floor((y - WAVEFORM_H) / LANE_H); }
-function strToLane(s) { return 5 - s; }
-function laneToStr(l) { return 5 - l; }
+function strToLane(s) { return (lanes() - 1) - s; }
+function laneToStr(l) { return (lanes() - 1) - l; }
 function strToY(s)   { return laneToY(strToLane(s)); }
-function yToStr(y)   { const l = Math.max(0, Math.min(5, yToLane(y))); return laneToStr(l); }
+function yToStr(y)   { const l = Math.max(0, Math.min(lanes() - 1, yToLane(y))); return laneToStr(l); }
 function canvasH()   {
     if (isKeysMode()) return WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H + BEAT_H;
-    return WAVEFORM_H + LANES * LANE_H + BEAT_H;
+    return WAVEFORM_H + lanes() * LANE_H + BEAT_H;
 }
 
 // ── Piano roll mode helpers ─────────────────────────────────────────
@@ -234,9 +287,10 @@ function reconstructChords() {
             newNotes.push(group[0]);
         } else {
             // Multiple notes at same time = chord
-            const frets = [-1, -1, -1, -1, -1, -1];
+            const L = lanes();
+            const frets = new Array(L).fill(-1);
             for (const n of group) {
-                if (n.string >= 0 && n.string < 6) frets[n.string] = n.fret;
+                if (n.string >= 0 && n.string < L) frets[n.string] = n.fret;
             }
             const fretKey = frets.join(',');
             let tmplIdx;
@@ -316,7 +370,8 @@ function drawWaveform(w) {
 
 function drawLanes(w) {
     if (isKeysMode()) return drawPianoLanes(w);
-    for (let l = 0; l < LANES; l++) {
+    const L = lanes();
+    for (let l = 0; l < L; l++) {
         const y = laneToY(l);
         ctx.fillStyle = l % 2 === 0 ? '#0c0c1c' : '#0f0f24';
         ctx.fillRect(LABEL_W, y, w - LABEL_W, LANE_H);
@@ -354,7 +409,7 @@ function drawGrid(w) {
     const et = S.scrollX + (w - LABEL_W) / S.zoom + 1;
     const laneBottom = isKeysMode()
         ? WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H
-        : WAVEFORM_H + LANES * LANE_H;
+        : WAVEFORM_H + lanes() * LANE_H;
     for (const b of S.beats) {
         if (b.time < st || b.time > et) continue;
         const x = timeToX(b.time);
@@ -374,7 +429,7 @@ function drawSections(w) {
     const et = S.scrollX + (w - LABEL_W) / S.zoom + 1;
     const laneBottom = isKeysMode()
         ? WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H
-        : WAVEFORM_H + LANES * LANE_H;
+        : WAVEFORM_H + lanes() * LANE_H;
     ctx.font = '9px monospace';
     ctx.textBaseline = 'top';
     for (const s of S.sections) {
@@ -398,7 +453,7 @@ function drawSections(w) {
 }
 
 function drawBeatBar(w) {
-    const y = WAVEFORM_H + LANES * LANE_H;
+    const y = WAVEFORM_H + lanes() * LANE_H;
     ctx.fillStyle = '#08081a';
     ctx.fillRect(0, y, w, BEAT_H);
     ctx.fillStyle = '#08081a';
@@ -430,17 +485,22 @@ function drawLabels(w) {
 
     if (isKeysMode()) return drawPianoLabels(w);
 
-    // String labels
-    for (let l = 0; l < LANES; l++) {
+    // String labels. `labels` is in RS string-index order (low → high); lanes
+    // are drawn high-to-low (lane 0 = top = highest string). STRING_COLORS is
+    // indexed *by lane* so the top lane is always red regardless of how many
+    // extra low strings push it up.
+    const L = lanes();
+    const labels = laneLabels();
+    for (let l = 0; l < L; l++) {
         const y = laneToY(l);
         ctx.fillStyle = '#0a0a1a';
         ctx.fillRect(0, y, LABEL_W, LANE_H);
         const s = laneToStr(l);
-        ctx.fillStyle = STRING_COLORS[s];
+        ctx.fillStyle = STRING_COLORS[l] || '#888';
         ctx.font = 'bold 12px monospace';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(LANE_LABELS[l], LABEL_W / 2, y + LANE_H / 2);
+        ctx.fillText(labels[s] || String(s), LABEL_W / 2, y + LANE_H / 2);
     }
 }
 
@@ -485,7 +545,7 @@ function _drawNote(n, selected) {
     const y = strToY(n.string) + NOTE_PAD;
     const sw = Math.max(MIN_NOTE_W, (n.sustain || 0) * S.zoom);
     const h = LANE_H - NOTE_PAD * 2;
-    const color = STRING_COLORS[n.string] || '#888';
+    const color = STRING_COLORS[strToLane(n.string)] || '#888';
 
     // Body
     ctx.fillStyle = color + 'cc';
@@ -861,7 +921,7 @@ function onMouseMove(e) {
 
     // Cursor hint when not dragging
     if (!S.drag) {
-        if (canvas && y >= WAVEFORM_H && y < WAVEFORM_H + LANES * LANE_H) {
+        if (canvas && y >= WAVEFORM_H && y < WAVEFORM_H + lanes() * LANE_H) {
             canvas.style.cursor = hitNoteEdge(x, y) >= 0 ? 'ew-resize' : '';
         } else if (canvas) {
             canvas.style.cursor = '';
@@ -919,7 +979,7 @@ function onMouseMove(e) {
                 nn[ni].time = newTime;
 
                 const origLane = strToLane(S.drag.origStrings[i]);
-                const newLane = Math.max(0, Math.min(5, origLane + dLanes));
+                const newLane = Math.max(0, Math.min(lanes() - 1, origLane + dLanes));
                 nn[ni].string = laneToStr(newLane);
             }
         }
@@ -994,7 +1054,7 @@ function onDblClick(e) {
     const keysMode = isKeysMode();
     const laneBottom = keysMode
         ? WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H
-        : WAVEFORM_H + LANES * LANE_H;
+        : WAVEFORM_H + lanes() * LANE_H;
     if (y < WAVEFORM_H || y > laneBottom) return;
 
     const idx = hitNote(x, y);
@@ -1037,7 +1097,7 @@ function onContextMenu(e) {
     // Right-click on beat bar or lanes with no note = section menu
     const beatBarY = isKeysMode()
         ? WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H
-        : WAVEFORM_H + LANES * LANE_H;
+        : WAVEFORM_H + lanes() * LANE_H;
     if (y >= beatBarY || (y >= WAVEFORM_H && hitNote(x, y) < 0)) {
         showSectionMenu(e.clientX, e.clientY, xToTime(x));
         return;
@@ -1789,7 +1849,7 @@ function resizeCanvas() {
     const minBeat = 20, minWave = 50;
     BEAT_H = Math.max(minBeat, Math.floor(h * 0.05));
     WAVEFORM_H = Math.max(minWave, Math.floor(h * 0.12));
-    LANE_H = Math.max(30, Math.floor((h - WAVEFORM_H - BEAT_H) / LANES));
+    LANE_H = Math.max(30, Math.floor((h - WAVEFORM_H - BEAT_H) / lanes()));
 
     canvas.width = w * DPR;
     canvas.height = h * DPR;
