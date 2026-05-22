@@ -35,6 +35,68 @@ _DRUM_TAB_ABSENT = object()
 _sessions = None
 
 
+def _mix_stems_for_editor(stem_paths: list, dest) -> bool:
+    """Mix multiple per-instrument stems into one Ogg file for editor
+    playback. A stem-split sloppak has no `full` mix on disk, so without
+    this the editor would play only the first stem (a lone instrument).
+
+    Re-encodes on every call (no mtime cache): the `full` / single-stem
+    branches re-copy each load too, and an mtime cache could serve a
+    stale mix if a sloppak is replaced in place with stems carrying
+    older timestamps. Returns True when `dest` holds a usable mix.
+    """
+    if len(stem_paths) < 2:
+        return False
+
+    ffmpeg = None
+    try:
+        from lib.audio import _ffmpeg_cmd
+        ffmpeg = _ffmpeg_cmd()
+    except Exception:
+        ffmpeg = None
+    if not ffmpeg:
+        ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+
+    inputs = []
+    for p in stem_paths:
+        inputs += ["-i", str(p)]
+    # normalize=0: sum the stems without amix's default ÷N attenuation —
+    # demucs stems sum back to ~the original mix level.
+    base = [ffmpeg, "-y", *inputs,
+            "-filter_complex", f"amix=inputs={len(stem_paths)}:normalize=0"]
+    # Encode to a UNIQUE temp file, then atomically rename onto `dest`.
+    # Unique (mkstemp) so two concurrent loads of the same audio_id don't
+    # race on one temp path; the `dest.suffix` (.ogg) is kept so ffmpeg
+    # still infers the Ogg muxer from the extension.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(dest.parent), prefix="editor_audio_mix_", suffix=dest.suffix)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        # Prefer libvorbis; fall back to the built-in encoder if the
+        # ffmpeg build lacks it (mirrors lib.audio._ffmpeg_wav_to_ogg).
+        for enc in (["-c:a", "libvorbis", "-q:a", "5"],
+                    ["-c:a", "vorbis", "-strict", "experimental", "-q:a", "5"]):
+            try:
+                r = subprocess.run(base + enc + [str(tmp)],
+                                   capture_output=True, timeout=180)
+                if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                    tmp.replace(dest)
+                    return True
+            except (subprocess.SubprocessError, OSError):
+                pass
+        return False
+    finally:
+        # Drop the temp file unless a successful encode already renamed
+        # it onto `dest`.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def setup(app, context):
     config_dir = context["config_dir"]
     get_dlc_dir = context["get_dlc_dir"]
@@ -406,10 +468,13 @@ def setup(app, context):
             for entry in (loaded.manifest.get("arrangements", []) or []):
                 arrangement_ids.append(entry.get("id", ""))
 
-            # Pick an audio URL: prefer the "full" stem, else the first stem.
+            # Pick the audio for editor playback. A freshly-converted
+            # sloppak has one `full` stem — use it directly. A stem-split
+            # sloppak has no `full` (Demucs removes full.ogg), only
+            # per-instrument stems; those must be MIXED back together,
+            # otherwise the editor would play just one instrument.
             audio_url = None
             audio_file = None
-            stem_path = None
 
             def _safe_stem_path(stem_entry: dict) -> "Path | None":
                 """Resolve stem file path and reject traversal outside source_dir."""
@@ -424,24 +489,64 @@ def setup(app, context):
                     return None
                 return candidate if candidate.exists() else None
 
-            for s in loaded.stems:
-                if s.get("id") == "full":
-                    stem_path = _safe_stem_path(s)
-                    break
-            if stem_path is None and loaded.stems:
-                stem_path = _safe_stem_path(loaded.stems[0])
-            if stem_path and stem_path.exists():
-                # Same basename-collision class as session_id: nested paths
-                # like `foo/bar.psarc` and `baz/bar.sloppak` both reduce
-                # to stem "bar". Use a sanitised full path so two browser
-                # tabs loading distinct songs don't overwrite each other's
-                # `editor_audio_*` file under STATIC_DIR.
-                audio_id = filename.replace("/", "__").replace("\\", "__").replace(" ", "_")
-                ext = stem_path.suffix
+            # Same basename-collision class as session_id: nested paths
+            # like `foo/bar.psarc` and `baz/bar.sloppak` both reduce to
+            # stem "bar". Use a sanitised full path so two browser tabs
+            # loading distinct songs don't overwrite each other's
+            # `editor_audio_*` file under STATIC_DIR.
+            audio_id = filename.replace("/", "__").replace("\\", "__").replace(" ", "_")
+
+            # Remove any editor_audio_<id>.* left by a prior load before
+            # writing this one — otherwise a stale file under a different
+            # extension (e.g. a mix `.ogg` when this load resolves a
+            # non-ogg `full` stem) could be served from a cached URL.
+            # Explicit extensions, not a glob: `audio_id` may contain
+            # glob metacharacters.
+            for _stale_ext in (".ogg", ".wav", ".mp3", ".m4a", ".flac",
+                               ".opus", ".aac"):
+                try:
+                    (STORAGE_DIR / f"editor_audio_{audio_id}{_stale_ext}").unlink(
+                        missing_ok=True)
+                except OSError:
+                    pass
+
+            full_stem = next((s for s in loaded.stems if s.get("id") == "full"), None)
+            full_path = _safe_stem_path(full_stem) if full_stem else None
+            if full_path and full_path.exists():
+                ext = full_path.suffix
                 dest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
-                shutil.copy2(stem_path, dest)
+                shutil.copy2(full_path, dest)
                 audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}{ext}"
-                audio_file = str(stem_path)
+                audio_file = str(full_path)
+            else:
+                # No usable `full` stem — either it's absent, or the
+                # manifest entry points at a missing/invalid file. Either
+                # way, fall back to mixing the per-instrument stems.
+                stem_paths = [p for p in (_safe_stem_path(s) for s in loaded.stems)
+                              if p is not None]
+                if len(stem_paths) == 1:
+                    sp = stem_paths[0]
+                    ext = sp.suffix
+                    dest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
+                    shutil.copy2(sp, dest)
+                    audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}{ext}"
+                    audio_file = str(sp)
+                elif len(stem_paths) > 1:
+                    dest = STORAGE_DIR / f"editor_audio_{audio_id}.ogg"
+                    if _mix_stems_for_editor(stem_paths, dest):
+                        audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}.ogg"
+                        audio_file = str(dest)
+                    else:
+                        # ffmpeg missing or the mix failed — fall back to a
+                        # single stem so the editor still has playable audio
+                        # (the pre-fix behavior). One instrument beats none.
+                        # The upfront sweep already cleared any stale mix.
+                        sp = stem_paths[0]
+                        ext = sp.suffix
+                        fdest = STORAGE_DIR / f"editor_audio_{audio_id}{ext}"
+                        shutil.copy2(sp, fdest)
+                        audio_url = f"{STORAGE_URL}/editor_audio_{audio_id}{ext}"
+                        audio_file = str(sp)
 
             result = _song_to_dict(song, audio_url)
             result["format"] = "sloppak"
