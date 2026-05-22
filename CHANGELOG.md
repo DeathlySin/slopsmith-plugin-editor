@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-05-22
+
+### Fixed
+- **Build CDLC** no longer drops chords from arrangements that weren't
+  the last one viewed. `editorBuild` ran `reconstructChords()` on every
+  arrangement without flattening first; `reconstructChords()` rebuilds
+  `arr.chords` purely from `arr.notes`, so any arrangement still in its
+  non-flattened state had all its chords silently wiped. Most visible
+  on a multi-track Guitar Pro import — e.g. a strummed-chord track
+  built into a chord-less arrangement. The build now flattens each
+  arrangement before reconstructing, matching the save path.
+
 ## [1.2.1] - 2026-05-22
 
 ### Fixed

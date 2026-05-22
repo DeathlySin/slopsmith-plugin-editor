@@ -3130,11 +3130,20 @@ window.editorBuild = async () => {
     if (!S.sessionId || !S.createMode) return;
     setStatus('Building CDLC...');
 
-    // Reconstruct chords for ALL arrangements before sending
+    // Reconstruct chords for ALL arrangements before sending. Each
+    // arrangement must be flattened first: reconstructChords() rebuilds
+    // arr.chords purely from arr.notes, so on an arrangement still in
+    // its non-flattened state (chords in arr.chords, not spread into
+    // arr.notes) it finds no note clusters and wipes every chord. Only
+    // the last-viewed arrangement is flattened, so without this the
+    // build silently drops chords from every other arrangement.
+    // flattenChords() is a no-op on already-flattened ones — this
+    // mirrors the flatten-then-reconstruct pass in _buildSaveBody.
     const savedArr = S.currentArr;
     const allArrangements = [];
     for (let i = 0; i < S.arrangements.length; i++) {
         S.currentArr = i;
+        flattenChords();
         reconstructChords();
         const arr = S.arrangements[i];
         allArrangements.push({
