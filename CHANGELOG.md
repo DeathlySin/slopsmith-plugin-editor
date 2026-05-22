@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-05-22
+
+### Fixed
+- The sync **offset** now also shifts `drum_tab` hits. Previously an
+  offset nudge moved the guitar notes, beat grid and sections but left
+  the drum chart behind, so drums ended up out of sync. Shifted hits
+  are clamped at 0 and rounded to 3 dp.
+
 ## [1.2.0] - 2026-05-22
 
 ### Added

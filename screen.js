@@ -2619,6 +2619,20 @@ window.editorApplyOffset = (val) => {
     for (const n of nn) n.time += delta;
     for (const b of S.beats) b.time += delta;
     for (const s of S.sections) s.start_time += delta;
+    // Drum-tab hits live outside S.arrangements, so the loops above miss
+    // them — shift them by the same delta or an offset nudge leaves the
+    // drum chart out of sync with the guitar/beats it just realigned.
+    // Clamp at 0 and round to 3 dp: the save path rejects hits with a
+    // negative `t` as malformed (silent loss), and 3 dp matches the
+    // server-side and drum-editor rounding conventions.
+    if (S.drumTab && Array.isArray(S.drumTab.hits)) {
+        for (const h of S.drumTab.hits) {
+            if (typeof h.t === 'number') {
+                h.t = Math.max(0, Math.round((h.t + delta) * 1000) / 1000);
+            }
+        }
+        S.drumTabDirty = true;
+    }
     document.getElementById('editor-offset').dataset.applied = String(offset);
     draw();
     setStatus(`Offset: ${offset >= 0 ? '+' : ''}${(offset * 1000).toFixed(0)}ms`);
