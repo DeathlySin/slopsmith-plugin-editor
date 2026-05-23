@@ -193,6 +193,55 @@ def setup(app, context):
     global _sessions
     _sessions = sessions
 
+    # Cache compat probes for the slopsmith core converter signatures —
+    # each function is stable for the process lifetime, so the
+    # inspect.signature call only needs to run once per converter.
+    _unmapped_support: dict = {}
+
+    def _supports_unmapped(fn) -> bool:
+        cached = _unmapped_support.get(fn)
+        if cached is not None:
+            return cached
+        try:
+            import inspect
+            ok = "out_unmapped" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            ok = False
+        _unmapped_support[fn] = ok
+        return ok
+
+    def _safe_unmapped_entry(midi, rec) -> dict:
+        """Coerce one out_unmapped entry to {midi, count, times} safely.
+
+        The converter (in slopsmith core) controls this shape today, but
+        any non-int count or non-list times in a future shape change
+        shouldn't 500 the import on response shaping. midi/count default
+        to 0; times to []. Non-finite / non-numeric / negative time
+        entries are dropped (the frontend would skip them anyway).
+        """
+        try:
+            midi_int = int(midi)
+        except (TypeError, ValueError):
+            midi_int = 0
+        if not isinstance(rec, dict):
+            return {"midi": midi_int, "count": 0, "times": []}
+        try:
+            count = max(0, int(rec.get("count", 0)))
+        except (TypeError, ValueError):
+            count = 0
+        raw_times = rec.get("times")
+        times: list = []
+        if isinstance(raw_times, (list, tuple)):
+            import math as _m
+            for t in raw_times:
+                try:
+                    tf = float(t)
+                except (TypeError, ValueError):
+                    continue
+                if _m.isfinite(tf) and tf >= 0:
+                    times.append(tf)
+        return {"midi": midi_int, "count": count, "times": times}
+
     def _arrangement_id(name: str, used: set) -> str:
         """Map an arrangement name to a stable filesystem-safe id, avoiding
         collisions (suffix counter starts at 2: bass, bass2, bass3, ...)."""
@@ -2099,8 +2148,21 @@ def setup(app, context):
 
         arr_name = str(data.get("arrangement_name") or "Drums") or "Drums"
 
+        # Capture MIDI notes the converter couldn't map so the client can
+        # surface a warning + manual-mapping UI rather than silently
+        # dropping percussion that's outside the 18-piece vocab.
+        unmapped: dict[int, dict] = {}
+
+        # Cached compat probe — see _supports_unmapped at setup scope.
+        supports = _supports_unmapped(convert_drum_track_to_drumtab)
+
         def _convert():
             song = guitarpro.parse(gp_path)
+            if supports:
+                return convert_drum_track_to_drumtab(
+                    song, track_index, audio_offset, arr_name,
+                    out_unmapped=unmapped,
+                )
             return convert_drum_track_to_drumtab(
                 song, track_index, audio_offset, arr_name,
             )
@@ -2128,7 +2190,15 @@ def setup(app, context):
             import warnings
             warnings.warn(f"Could not clean up GP temp dir: {_cleanup_err}")
 
-        return {"drum_tab": drum_tab}
+        # Sort unmapped by MIDI ascending so the client UI is stable.
+        # Defensive .get() reads — if a future converter shape ever leaves
+        # `count` or `times` partially populated, return zero/empty rather
+        # than KeyError'ing a successful import into a 500.
+        unmapped_list = [
+            _safe_unmapped_entry(m, rec)
+            for m, rec in sorted(unmapped.items())
+        ]
+        return {"drum_tab": drum_tab, "unmapped": unmapped_list}
 
     # ── MIDI drum import: list channel 10 (index 9) tracks ──────────
 
@@ -2212,7 +2282,20 @@ def setup(app, context):
 
         arr_name = str(data.get("arrangement_name") or "Drums") or "Drums"
 
+        # Capture MIDI notes the converter couldn't map so the client can
+        # surface a warning + manual-mapping UI rather than silently
+        # dropping percussion that's outside the 18-piece vocab.
+        unmapped: dict[int, dict] = {}
+
+        # Cached compat probe — see _supports_unmapped at setup scope.
+        supports = _supports_unmapped(convert_drum_track_from_midi)
+
         def _convert():
+            if supports:
+                return convert_drum_track_from_midi(
+                    midi_path, track_index, audio_offset, arr_name,
+                    out_unmapped=unmapped,
+                )
             return convert_drum_track_from_midi(
                 midi_path, track_index, audio_offset, arr_name,
             )
@@ -2244,7 +2327,14 @@ def setup(app, context):
             import warnings
             warnings.warn(f"Could not clean up drums MIDI temp dir: {_cleanup_err}")
 
-        return {"drum_tab": drum_tab}
+        # Defensive .get() reads — if a future converter shape ever leaves
+        # `count` or `times` partially populated, return zero/empty rather
+        # than KeyError'ing a successful import into a 500.
+        unmapped_list = [
+            _safe_unmapped_entry(m, rec)
+            for m, rec in sorted(unmapped.items())
+        ]
+        return {"drum_tab": drum_tab, "unmapped": unmapped_list}
 
     # ── Remove arrangement from session ────────────────────────────
 

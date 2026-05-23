@@ -3560,13 +3560,27 @@ window.editorDoAddDrums = async () => {
         S.drumSel = new Set();
 
         editorHideAddDrumsModal();
-        const hitCount = (data.drum_tab.hits || []).length;
-        setStatus(`Drum tab imported (${hitCount} hits) — save to persist`);
+        const hitCount = Array.isArray(data.drum_tab.hits)
+            ? data.drum_tab.hits.length : 0;
+        const unmapped = Array.isArray(data.unmapped) ? data.unmapped : [];
+        const droppedCount = unmapped.reduce((s, u) => s + Math.max(0, Number(u.count) || 0), 0);
+        if (droppedCount > 0) {
+            setStatus(`Drum tab imported (${hitCount} hits, ${droppedCount} unmapped — see dialog) — save to persist`);
+        } else {
+            setStatus(`Drum tab imported (${hitCount} hits) — save to persist`);
+        }
         // Refresh the toolbar drum button (text/colour) and canvas so the
         // user immediately sees the "⟳ Drums (N)" state without waiting for
         // an unrelated redraw.
         updateArrangementSelector();
         draw();
+        // Surface the warning + manual-mapping UI only when there are
+        // actual notes to triage — gate on droppedCount rather than
+        // unmapped.length so an empty/zero-count row can't open a
+        // hollow dialog.
+        if (droppedCount > 0) {
+            _showDrumImportUnmappedModal(unmapped);
+        }
     } catch (e) {
         statusEl.textContent = 'Failed: ' + e.message;
         goBtn.disabled = false;
@@ -4392,13 +4406,195 @@ function drawGhostNotes() {
 // Physical-kit ordering of the drum piece-ids. Mirrors lib/drums.py's
 // PIECES dict but ordered for visual editing rather than data shape.
 const DRUM_PIECE_ORDER = [
-    'china', 'splash', 'crash_l', 'crash_r',
+    'china', 'splash', 'crash_l', 'crash_r', 'stack',
     'hh_open', 'hh_closed', 'hh_pedal',
-    'ride', 'ride_bell',
+    'ride', 'ride_bell', 'bell',
     'tom_hi', 'tom_mid', 'tom_low', 'tom_floor',
     'snare', 'snare_xstick',
     'kick',
 ];
+
+// GM Percussion (channel 10) names for the unmapped-notes import dialog
+// — gives users a hint of what was dropped instead of just a number.
+const _GM_PERC_NAMES = {
+    27: 'High Q',           28: 'Slap',             29: 'Scratch Push',
+    30: 'Scratch Pull',     31: 'Sticks',           32: 'Square Click',
+    33: 'Metronome Click',  34: 'Metronome Bell',   35: 'Acoustic Bass Drum',
+    36: 'Bass Drum 1',      37: 'Side Stick',       38: 'Acoustic Snare',
+    39: 'Hand Clap',        40: 'Electric Snare',   41: 'Low Floor Tom',
+    42: 'Closed Hi-Hat',    43: 'High Floor Tom',   44: 'Pedal Hi-Hat',
+    45: 'Low Tom',          46: 'Open Hi-Hat',      47: 'Low-Mid Tom',
+    48: 'Hi-Mid Tom',       49: 'Crash Cymbal 1',   50: 'High Tom',
+    51: 'Ride Cymbal 1',    52: 'Chinese Cymbal',   53: 'Ride Bell',
+    54: 'Tambourine',       55: 'Splash Cymbal',    56: 'Cowbell',
+    57: 'Crash Cymbal 2',   58: 'Vibraslap',        59: 'Ride Cymbal 2',
+    60: 'Hi Bongo',         61: 'Low Bongo',        62: 'Mute Hi Conga',
+    63: 'Open Hi Conga',    64: 'Low Conga',        65: 'High Timbale',
+    66: 'Low Timbale',      67: 'High Agogo',       68: 'Low Agogo',
+    69: 'Cabasa',           70: 'Maracas',          71: 'Short Whistle',
+    72: 'Long Whistle',     73: 'Short Guiro',      74: 'Long Guiro',
+    75: 'Claves',           76: 'Hi Wood Block',    77: 'Low Wood Block',
+    78: 'Mute Cuica',       79: 'Open Cuica',       80: 'Mute Triangle',
+    81: 'Open Triangle',    82: 'Shaker',           83: 'Jingle Bell',
+    84: 'Belltree',         85: 'Castanets',        86: 'Mute Surdo',
+    87: 'Open Surdo',
+};
+
+// Post-import warning: the server returns any percussion notes it couldn't
+// auto-map to one of the 18 drum pieces. Show them with a per-row dropdown
+// so the user can drop them or hand-map each one. Synthesizes hits client-
+// side from the times the server captured — no second server round-trip.
+function _showDrumImportUnmappedModal(unmapped) {
+    document.getElementById('editor-drum-unmapped-modal')?.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'editor-drum-unmapped-modal';
+    modal.className = 'fixed inset-0 bg-black/70 z-50 flex items-center justify-center';
+
+    const inner = document.createElement('div');
+    inner.className = 'bg-dark-800 border border-gray-700 rounded-lg p-6 max-w-2xl w-full max-h-[80vh] flex flex-col mx-4';
+
+    const title = document.createElement('h3');
+    title.className = 'text-lg font-semibold mb-2';
+    title.textContent = 'Unmapped percussion notes';
+    inner.appendChild(title);
+
+    const total = unmapped.reduce((s, u) => s + Math.max(0, Number(u.count) || 0), 0);
+    const intro = document.createElement('p');
+    intro.className = 'text-sm text-gray-400 mb-4';
+    intro.textContent = `${total} note${total === 1 ? '' : 's'} (across `
+        + `${unmapped.length} MIDI value${unmapped.length === 1 ? '' : 's'}) `
+        + `don't map to one of the ${DRUM_PIECE_ORDER.length} slopsmith drum `
+        + `pieces. Drop them, or pick a drum piece per row and add them to `
+        + `your tab.`;
+    inner.appendChild(intro);
+
+    const listWrap = document.createElement('div');
+    listWrap.className = 'flex-1 overflow-y-auto border border-gray-700 rounded mb-4';
+    const table = document.createElement('table');
+    table.className = 'w-full text-sm';
+    const thead = document.createElement('thead');
+    thead.innerHTML = '<tr class="bg-dark-700 text-gray-400">'
+        + '<th class="text-left p-2">MIDI</th>'
+        + '<th class="text-left p-2">GM name</th>'
+        + '<th class="text-left p-2">Count</th>'
+        + '<th class="text-left p-2">Map to</th></tr>';
+    table.appendChild(thead);
+
+    // Keep the times arrays in a JS Map keyed by the row element rather
+    // than round-tripping through JSON.stringify/JSON.parse on a dataset
+    // attribute — avoids extra CPU + DOM payload for large unmapped sets.
+    const rowTimes = new Map();
+    const tbody = document.createElement('tbody');
+    for (const u of unmapped) {
+        const tr = document.createElement('tr');
+        tr.className = 'border-t border-gray-800';
+        tr.dataset.midi = String(u.midi);
+        rowTimes.set(tr, Array.isArray(u.times) ? u.times : []);
+        const tdMidi = document.createElement('td');
+        tdMidi.className = 'p-2 font-mono';
+        tdMidi.textContent = u.midi;
+        const tdName = document.createElement('td');
+        tdName.className = 'p-2 text-gray-500';
+        tdName.textContent = _GM_PERC_NAMES[u.midi] || '—';
+        const tdCount = document.createElement('td');
+        tdCount.className = 'p-2';
+        // Coerce to a number so a malformed response (missing / null /
+        // non-numeric count) doesn't render "undefined" in the cell.
+        tdCount.textContent = Number(u.count) || 0;
+        const tdMap = document.createElement('td');
+        tdMap.className = 'p-2';
+        const sel = document.createElement('select');
+        sel.className = 'bg-dark-700 border border-gray-700 rounded px-1 py-0.5';
+        const optDrop = document.createElement('option');
+        optDrop.value = '';
+        optDrop.textContent = '(drop)';
+        sel.appendChild(optDrop);
+        for (const pid of DRUM_PIECE_ORDER) {
+            const opt = document.createElement('option');
+            opt.value = pid;
+            opt.textContent = (DRUM_PIECE_META[pid] && DRUM_PIECE_META[pid].label) || pid;
+            sel.appendChild(opt);
+        }
+        tdMap.appendChild(sel);
+        tr.appendChild(tdMidi);
+        tr.appendChild(tdName);
+        tr.appendChild(tdCount);
+        tr.appendChild(tdMap);
+        tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    listWrap.appendChild(table);
+    inner.appendChild(listWrap);
+
+    const buttons = document.createElement('div');
+    buttons.className = 'flex justify-end gap-2';
+    const dropBtn = document.createElement('button');
+    dropBtn.className = 'px-3 py-1 bg-dark-700 hover:bg-dark-600 rounded';
+    // The notes are already dropped server-side; closing the dialog
+    // discards them permanently (no way to reopen). Label matches that
+    // intent so it's clearly the inverse of "Add mapped".
+    dropBtn.textContent = 'Discard unmapped';
+    dropBtn.onclick = () => modal.remove();
+    const addBtn = document.createElement('button');
+    addBtn.className = 'px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded';
+    addBtn.textContent = 'Add mapped';
+    addBtn.onclick = () => {
+        if (!S.drumTab || !Array.isArray(S.drumTab.hits)) {
+            modal.remove();
+            return;
+        }
+        // Build a key-set of existing hits so we don't duplicate against
+        // the imported drum_tab if two unmapped notes resolve to the
+        // same (rounded-time, piece) — keeps the editor's in-memory
+        // hits consistent with what the server would dedupe on save.
+        const seen = new Set(S.drumTab.hits.map(
+            h => `${Math.round((h.t || 0) * 1000)}|${h.p}`));
+        let added = 0, skipped = 0;
+        for (const tr of tbody.querySelectorAll('tr')) {
+            const sel = tr.querySelector('select');
+            if (!sel || !sel.value) continue;
+            const pid = sel.value;
+            const times = rowTimes.get(tr) || [];
+            for (const t of times) {
+                // Guard against malformed payload: skip NaN / Infinity /
+                // negative times rather than push invalid hit objects
+                // that break sort/draw and would be dropped by the
+                // backend on save anyway.
+                if (!Number.isFinite(t) || t < 0) continue;
+                const tRounded = Math.round(t * 1000) / 1000;
+                const key = `${Math.round(t * 1000)}|${pid}`;
+                if (seen.has(key)) { skipped++; continue; }
+                seen.add(key);
+                S.drumTab.hits.push({ t: tRounded, p: pid, v: 100 });
+                added++;
+            }
+        }
+        if (added > 0) {
+            S.drumTab.hits.sort((a, b) => (a.t || 0) - (b.t || 0));
+            S.drumTabDirty = true;
+            updateArrangementSelector();
+            draw();
+        }
+        if (added > 0 || skipped > 0) {
+            const skipMsg = skipped > 0 ? ` (${skipped} duplicate${skipped === 1 ? '' : 's'} skipped)` : '';
+            setStatus(`Added ${added} hit${added === 1 ? '' : 's'} from mapped notes${skipMsg} — save to persist`);
+        }
+        modal.remove();
+    };
+    buttons.appendChild(dropBtn);
+    buttons.appendChild(addBtn);
+    inner.appendChild(buttons);
+
+    // Stop key events at the modal boundary so the global onKeyDown
+    // doesn't intercept Space (→ play/pause) or Delete while a button
+    // is focused. The browser still gets the event to activate the
+    // focused button on Space/Enter natively.
+    modal.addEventListener('keydown', (e) => e.stopPropagation());
+
+    modal.appendChild(inner);
+    document.body.appendChild(modal);
+}
 
 // Display colour + shape hint per piece-id — mirrors lib/drums.py::PIECES
 // so the editor visual matches what the player highway shows.
@@ -4417,8 +4613,10 @@ const DRUM_PIECE_META = {
     crash_r:      { label: 'Crash R',color: '#65a30d', cat: 'cymbal' },
     splash:       { label: 'Splash', color: '#a3e635', cat: 'cymbal' },
     china:        { label: 'China',  color: '#4d7c0f', cat: 'cymbal' },
+    stack:        { label: 'Stack',  color: '#94a3b8', cat: 'cymbal' },
     ride:         { label: 'Ride',   color: '#3b82f6', cat: 'cymbal' },
-    ride_bell:    { label: 'Bell',   color: '#1d4ed8', cat: 'cymbal' },
+    ride_bell:    { label: 'R.Bell', color: '#1d4ed8', cat: 'cymbal' },
+    bell:         { label: 'Bell',   color: '#fde047', cat: 'cymbal' },
 };
 
 const DRUM_LANE_H = 22;

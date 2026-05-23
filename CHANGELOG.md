@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-05-23
+
+### Added
+- **Drum vocab expanded to 18 pieces.** The drum editor's lane grid now
+  shows the new `stack` (between Crash R and HH Open) and `bell` (after
+  R.Bell) lanes from core's expanded PIECES dict. The existing
+  `ride_bell` label is shortened to `R.Bell` to disambiguate from the
+  new dedicated `bell` (bell cymbal) piece. Requires slopsmith core
+  ≥ 0.2.9-alpha.4 for the new piece-ids.
+- **Drum import — unmapped-notes warning + manual mapping.** When you
+  import a GP or MIDI drum track containing percussion that doesn't map
+  to one of the 18 slopsmith drum pieces (cowbell, tambourine, etc.),
+  a dialog now lists the unmapped MIDI notes (with their GM names + hit
+  counts) and lets you either drop them or pick a drum piece per row.
+  Previously these notes were silently dropped on import. The
+  `import-drums-tab` and `import-drums-midi` endpoints surface them via
+  a new `unmapped: [{midi, count, times}]` field; the editor builds the
+  warning + mapping UI client-side.
+
 ## [1.2.1] - 2026-05-22
 
 ### Fixed
