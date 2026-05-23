@@ -5128,10 +5128,18 @@ function _drumEditorDraw(w, h) {
         const alpha = Math.max(0.4, vel / 127);
         const r = h.g ? DRUM_HIT_RADIUS * 0.6 : DRUM_HIT_RADIUS;
 
-        // Selection halo
+        // Selection halo — a thin bright amber RING (not a filled white
+        // circle). The previous filled style read like a permanent
+        // property of the hit ("what's the big white circle around
+        // that note?"); a coloured outline clearly says "this hit is
+        // currently selected — click elsewhere to deselect".
         if (sel) {
-            ctx.fillStyle = 'rgba(255,255,255,0.25)';
-            ctx.beginPath(); ctx.arc(cx, cy, r + 4, 0, Math.PI * 2); ctx.fill();
+            ctx.strokeStyle = '#facc15';   // amber-400
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.lineWidth = 1;             // reset for downstream draws
         }
 
         // Shape: cymbals = circle (ring if open hat), drums = rect,
