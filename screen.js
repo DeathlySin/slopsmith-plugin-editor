@@ -2885,6 +2885,130 @@ let createState = {
     artPath: null,
 };
 
+// ════════════════════════════════════════════════════════════════════
+// "New…" entry point — format picker → sloppak-create OR PSARC-create.
+// The button used to go straight to the PSARC create modal; drummers
+// asked for a sloppak-first path so they don't have to make-PSARC-
+// then-save-as-sloppak just to land in drum-charting mode.
+// ════════════════════════════════════════════════════════════════════
+
+// Shared keyboard-handling for dynamically-generated modals: stop
+// propagation so global shortcuts can't fire, trap Tab/Shift-Tab so
+// focus doesn't escape, close on Escape. Returns the keydown listener
+// so callers could remove it on close if they ever wanted to.
+function _installModalKeyboard(modal, inner, onClose) {
+    const FOCUSABLE_SEL = 'a[href], button:not([disabled]),'
+        + ' input:not([disabled]), select:not([disabled]),'
+        + ' textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    // Backdrop must be focusable so click-on-overlay can still receive
+    // focus (and we can immediately re-direct it inside) — otherwise
+    // the click sends focus to <body>, key events skip the modal
+    // handler, and global editor shortcuts (Space/Delete/…) fire
+    // through the dimmed background.
+    modal.tabIndex = -1;
+    modal.addEventListener('mousedown', (e) => {
+        if (e.target === modal) {
+            // Defer until after the click's default focus change so we
+            // win the focus-move race.
+            setTimeout(() => {
+                const f = inner.querySelector(FOCUSABLE_SEL);
+                f?.focus();
+            }, 0);
+        }
+    });
+    const handler = (e) => {
+        e.stopPropagation();
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            onClose();
+            return;
+        }
+        if (e.key === 'Tab') {
+            const items = Array.from(inner.querySelectorAll(FOCUSABLE_SEL));
+            if (!items.length) return;
+            const first = items[0], last = items[items.length - 1];
+            const active = document.activeElement;
+            // If focus is on the backdrop itself (after an overlay
+            // click) or on anything outside `inner`, Tab would
+            // otherwise escape via the browser's default sequential
+            // navigation. Pull it back to the appropriate end.
+            const insideInner = inner.contains(active);
+            if (e.shiftKey && (!insideInner || active === first)) {
+                e.preventDefault(); last.focus();
+            } else if (!e.shiftKey && (!insideInner || active === last)) {
+                e.preventDefault(); first.focus();
+            }
+        }
+    };
+    modal.addEventListener('keydown', handler);
+    return handler;
+}
+
+window.editorShowNewFormatPicker = () => {
+    // Remove any stale picker (e.g. opened twice).
+    document.getElementById('editor-new-format-picker')?.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'editor-new-format-picker';
+    modal.className = 'fixed inset-0 bg-black/70 z-50 flex items-center justify-center';
+
+    const inner = document.createElement('div');
+    inner.className = 'bg-dark-800 border border-gray-700 rounded-lg p-6 max-w-md w-full mx-4';
+
+    const title = document.createElement('h3');
+    title.className = 'text-lg font-semibold mb-4';
+    title.textContent = 'What are you making?';
+    inner.appendChild(title);
+
+    const mkBtn = (heading, blurb, onClick) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'w-full text-left p-3 mb-2 bg-dark-700 hover:bg-dark-600 rounded border border-gray-700';
+        const h = document.createElement('div');
+        h.className = 'font-medium text-sm';
+        h.textContent = heading;
+        const p = document.createElement('div');
+        p.className = 'text-xs text-gray-400 mt-1';
+        p.textContent = blurb;
+        b.appendChild(h); b.appendChild(p);
+        b.onclick = () => { modal.remove(); onClick(); };
+        return b;
+    };
+    inner.appendChild(mkBtn(
+        '🎵  Sloppak',
+        'Audio + chart with drum tab and stems available from the start. '
+        + 'Best for new songs.',
+        () => window.editorShowCreateSloppakModal(),
+    ));
+    inner.appendChild(mkBtn(
+        '🎸  PSARC',
+        'Classic Rocksmith CDLC. Use this for guitar/bass charts that '
+        + 'need the native Rocksmith format.',
+        () => window.editorShowCreateModal(),
+    ));
+
+    const cancel = document.createElement('div');
+    cancel.className = 'flex justify-end mt-2';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'px-3 py-1 bg-dark-700 hover:bg-dark-600 rounded text-sm';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => modal.remove();
+    cancel.appendChild(cancelBtn);
+    inner.appendChild(cancel);
+
+    modal.appendChild(inner);
+    // Keep global shortcuts (Space → play, Delete → erase notes, etc.)
+    // from firing while the picker is open, but handle Escape locally
+    // so keyboard users can dismiss without tabbing to Cancel.
+    _installModalKeyboard(modal, inner, () => modal.remove());
+    document.body.appendChild(modal);
+    // Move focus into the modal so subsequent keystrokes (Escape,
+    // Tab, etc.) bubble through this listener — otherwise focus
+    // stays on the toolbar "New…" button outside the modal and the
+    // global onKeyDown still gets keystrokes.
+    inner.querySelector('button')?.focus();
+};
+
 window.editorShowCreateModal = () => {
     createState = { gpPath: null, tracks: null, audioUrl: null, audioMode: 'file', artPath: null };
     document.getElementById('editor-create-modal').classList.remove('hidden');
@@ -2904,6 +3028,291 @@ window.editorShowCreateModal = () => {
 
 window.editorHideCreateModal = () => {
     document.getElementById('editor-create-modal').classList.add('hidden');
+};
+
+// ════════════════════════════════════════════════════════════════════
+// Sloppak-create modal — straight to sloppak mode with optional empty
+// drum_tab pre-initialised. POSTs multipart {audio, metadata JSON} to
+// /api/plugins/editor/create_sloppak; on success the editor opens the
+// newly-written sloppak via the existing loadCDLC path.
+// ════════════════════════════════════════════════════════════════════
+
+window.editorShowCreateSloppakModal = () => {
+    document.getElementById('editor-create-sloppak-modal')?.remove();
+
+    let audioFile = null;
+
+    const modal = document.createElement('div');
+    modal.id = 'editor-create-sloppak-modal';
+    modal.className = 'fixed inset-0 bg-black/70 z-50 flex items-center justify-center';
+
+    const inner = document.createElement('div');
+    inner.className = 'bg-dark-800 border border-gray-700 rounded-lg p-6 max-w-xl w-full mx-4 max-h-[90vh] overflow-y-auto';
+
+    const title = document.createElement('h3');
+    title.className = 'text-lg font-semibold mb-1';
+    title.textContent = 'New Sloppak';
+    inner.appendChild(title);
+
+    const sub = document.createElement('p');
+    sub.className = 'text-xs text-gray-400 mb-4';
+    sub.textContent = 'Audio + chart in slopsmith\'s native sloppak format.';
+    inner.appendChild(sub);
+
+    // ── Audio drop / picker ─────────────────────────────────────────
+    // It's a <div> for layout reasons (drop targets need to accept
+    // dragover/drop, which is awkward on a native <button>), but
+    // semantically it behaves like a button — surface that to assistive
+    // tech via role + an accessible name, and to keyboards via the
+    // existing Space/Enter handler.
+    const dropZone = document.createElement('div');
+    dropZone.className = 'border-2 border-dashed border-gray-600 hover:border-gray-500 rounded p-6 mb-3 text-center cursor-pointer transition-colors';
+    dropZone.tabIndex = 0;
+    dropZone.setAttribute('role', 'button');
+    dropZone.setAttribute('aria-label',
+        'Pick or drop the audio file for the new sloppak');
+    const dropMsg = document.createElement('div');
+    dropMsg.className = 'text-sm text-gray-400';
+    dropMsg.textContent = 'Drop an audio file here, or click to pick';
+    const dropHint = document.createElement('div');
+    dropHint.className = 'text-xs text-gray-600 mt-1';
+    dropHint.textContent = 'mp3 / wav / flac / m4a / ogg';
+    dropZone.appendChild(dropMsg);
+    dropZone.appendChild(dropHint);
+
+    const hiddenFileInput = document.createElement('input');
+    hiddenFileInput.type = 'file';
+    hiddenFileInput.accept = 'audio/*,.mp3,.wav,.flac,.m4a,.ogg,.opus';
+    hiddenFileInput.className = 'hidden';
+    dropZone.appendChild(hiddenFileInput);
+
+    const setAudio = (file) => {
+        audioFile = file || null;
+        if (!file) {
+            dropMsg.textContent = 'Drop an audio file here, or click to pick';
+            dropMsg.className = 'text-sm text-gray-400';
+            dropHint.textContent = 'mp3 / wav / flac / m4a / ogg';
+            return;
+        }
+        dropMsg.textContent = `📂 ${file.name}`;
+        dropMsg.className = 'text-sm text-gray-200';
+        const mb = (file.size / 1048576).toFixed(1);
+        // .ogg uploads skip the ffmpeg re-encode pass server-side; the
+        // hint should reflect that rather than always promising a
+        // re-encode.
+        const isOgg = /\.ogg$/i.test(file.name || '');
+        dropHint.textContent = isOgg
+            ? `${mb} MB — kept as .ogg (no re-encode)`
+            : `${mb} MB — re-encoded to .ogg on create`;
+    };
+
+    dropZone.onclick = () => hiddenFileInput.click();
+    dropZone.onkeydown = (e) => {
+        if (e.key === ' ' || e.key === 'Enter') {
+            e.preventDefault();
+            hiddenFileInput.click();
+        }
+    };
+    hiddenFileInput.onchange = () => setAudio(hiddenFileInput.files?.[0] || null);
+    dropZone.ondragover = (e) => {
+        e.preventDefault();
+        dropZone.classList.add('border-blue-500');
+    };
+    dropZone.ondragleave = () => dropZone.classList.remove('border-blue-500');
+    dropZone.ondrop = (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('border-blue-500');
+        setAudio(e.dataTransfer.files?.[0] || null);
+    };
+    inner.appendChild(dropZone);
+
+    // ── Metadata fields ─────────────────────────────────────────────
+    const mkRow = (label, el) => {
+        const row = document.createElement('div');
+        row.className = 'mb-2';
+        const lab = document.createElement('label');
+        lab.className = 'block text-xs text-gray-400 mb-1';
+        lab.textContent = label;
+        row.appendChild(lab);
+        row.appendChild(el);
+        return row;
+    };
+    const mkInput = (placeholder, type = 'text') => {
+        const i = document.createElement('input');
+        i.type = type;
+        i.placeholder = placeholder;
+        i.className = 'w-full px-2 py-1 bg-dark-700 border border-gray-700 rounded text-sm';
+        return i;
+    };
+
+    const titleInput = mkInput('Song title');
+    const artistInput = mkInput('Artist');
+    const albumInput = mkInput('Album (optional)');
+    const yearInput = mkInput('Year (optional)', 'number');
+    inner.appendChild(mkRow('Title', titleInput));
+    inner.appendChild(mkRow('Artist', artistInput));
+
+    const albumRow = document.createElement('div');
+    albumRow.className = 'grid grid-cols-3 gap-2 mb-2';
+    const albumWrap = mkRow('Album', albumInput); albumWrap.className = 'col-span-2 mb-0';
+    const yearWrap = mkRow('Year', yearInput); yearWrap.className = 'mb-0';
+    albumRow.appendChild(albumWrap);
+    albumRow.appendChild(yearWrap);
+    inner.appendChild(albumRow);
+
+    // ── Initial arrangement ────────────────────────────────────────
+    const arrRow = document.createElement('div');
+    arrRow.className = 'mb-2';
+    const arrLab = document.createElement('label');
+    arrLab.className = 'block text-xs text-gray-400 mb-1';
+    arrLab.textContent = 'Initial arrangement';
+    arrRow.appendChild(arrLab);
+    const arrButtons = document.createElement('div');
+    arrButtons.className = 'flex gap-1';
+    let arrChoice = 'Lead';
+    const refreshArrButtons = () => {
+        arrButtons.querySelectorAll('button').forEach(b => {
+            const on = b.dataset.arr === arrChoice;
+            b.className = 'px-3 py-1 rounded text-sm ' + (on
+                ? 'bg-blue-600 text-white'
+                : 'bg-dark-700 hover:bg-dark-600 text-gray-300');
+        });
+    };
+    for (const name of ['Lead', 'Rhythm', 'Bass']) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.dataset.arr = name;
+        b.textContent = name;
+        b.onclick = () => { arrChoice = name; refreshArrButtons(); };
+        arrButtons.appendChild(b);
+    }
+    refreshArrButtons();
+    arrRow.appendChild(arrButtons);
+    inner.appendChild(arrRow);
+
+    const arrNote = document.createElement('p');
+    arrNote.className = 'text-xs text-gray-500 mb-3';
+    arrNote.textContent = 'Default tuning is E standard (Bass: BEAD-equivalent 4 strings). Adjust later from the editor toolbar.';
+    inner.appendChild(arrNote);
+
+    // ── Drum tab init ──────────────────────────────────────────────
+    const drumWrap = document.createElement('label');
+    drumWrap.className = 'flex items-center gap-2 mb-4 cursor-pointer';
+    const drumCb = document.createElement('input');
+    drumCb.type = 'checkbox';
+    drumCb.checked = true;
+    drumCb.className = 'cursor-pointer';
+    const drumLab = document.createElement('span');
+    drumLab.className = 'text-sm';
+    drumLab.textContent = 'Also start an empty drum tab';
+    drumWrap.appendChild(drumCb);
+    drumWrap.appendChild(drumLab);
+    inner.appendChild(drumWrap);
+
+    // ── Status + buttons ───────────────────────────────────────────
+    const status = document.createElement('div');
+    status.className = 'text-xs mb-2 min-h-[1em]';
+    inner.appendChild(status);
+
+    const buttons = document.createElement('div');
+    buttons.className = 'flex justify-end gap-2';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'px-3 py-1 bg-dark-700 hover:bg-dark-600 rounded text-sm';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => modal.remove();
+
+    let inFlight = false;
+    const createBtn = document.createElement('button');
+    createBtn.className = 'px-3 py-1 bg-green-700 hover:bg-green-600 rounded text-sm font-medium';
+    createBtn.textContent = 'Create';
+    createBtn.onclick = async () => {
+        if (!audioFile) {
+            status.textContent = 'Pick an audio file first.';
+            status.className = 'text-xs mb-2 min-h-[1em] text-red-400';
+            return;
+        }
+        const t = titleInput.value.trim();
+        const a = artistInput.value.trim();
+        if (!t) {
+            status.textContent = 'Title is required.';
+            status.className = 'text-xs mb-2 min-h-[1em] text-red-400';
+            titleInput.focus();
+            return;
+        }
+        if (!a) {
+            status.textContent = 'Artist is required.';
+            status.className = 'text-xs mb-2 min-h-[1em] text-red-400';
+            artistInput.focus();
+            return;
+        }
+        const yearRaw = yearInput.value.trim();
+        // Send year as a string verbatim — the backend extracts the
+        // 4-digit year via regex and accepts either int or str.
+        // `Number(yearRaw) || yearRaw` would coerce "1990.5" to a
+        // float which the strict backend validator rejects with 400.
+        const meta = {
+            title: t,
+            artist: a,
+            album: albumInput.value.trim(),
+            year: yearRaw,
+            initial_arrangement: arrChoice,
+            init_drum_tab: drumCb.checked,
+        };
+        const fd = new FormData();
+        fd.append('audio', audioFile);
+        fd.append('metadata', JSON.stringify(meta));
+
+        inFlight = true;
+        createBtn.disabled = true;
+        cancelBtn.disabled = true;
+        status.className = 'text-xs mb-2 min-h-[1em] text-gray-400';
+        status.textContent = 'Uploading + building sloppak…';
+        try {
+            const resp = await fetch('/api/plugins/editor/create_sloppak', {
+                method: 'POST', body: fd,
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) {
+                status.textContent = 'Error: ' + (data.error || resp.statusText);
+                status.className = 'text-xs mb-2 min-h-[1em] text-red-400';
+                inFlight = false;
+                createBtn.disabled = false;
+                cancelBtn.disabled = false;
+                return;
+            }
+            modal.remove();
+            // Open the freshly-written sloppak via the existing load
+            // path so the editor state initialises identically to a
+            // normal sloppak load.
+            await loadCDLC(data.filename);
+        } catch (e) {
+            status.textContent = 'Failed: ' + e.message;
+            status.className = 'text-xs mb-2 min-h-[1em] text-red-400';
+            inFlight = false;
+            createBtn.disabled = false;
+            cancelBtn.disabled = false;
+        }
+    };
+    buttons.appendChild(cancelBtn);
+    buttons.appendChild(createBtn);
+    inner.appendChild(buttons);
+
+    modal.appendChild(inner);
+    // Stop key events at the modal boundary so the global onKeyDown
+    // doesn't intercept Space (toggle play) while typing in inputs,
+    // but honor Escape locally so keyboard users can dismiss the
+    // dialog the way they'd expect.
+    // Escape closes the dialog UNLESS a create is in-flight — once the
+    // server-side write starts we don't want Escape to "dismiss" the
+    // UI while the request is still going to land a new sloppak (and
+    // open it). Cancel button is already disabled in the same state.
+    _installModalKeyboard(modal, inner, () => {
+        if (inFlight) return;
+        modal.remove();
+    });
+    document.body.appendChild(modal);
+
+    titleInput.focus();
 };
 
 window.editorSetAudioMode = (mode) => {

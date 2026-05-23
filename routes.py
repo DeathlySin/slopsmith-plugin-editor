@@ -1404,6 +1404,398 @@ def setup(app, context):
             "format": "sloppak",
         }
 
+    # ── Create new Sloppak from scratch ───────────────────────────────
+    #
+    # Drummer-driven flow: instead of "create new CDLC (PSARC) →
+    # save-as-sloppak → +drums", let the user pick "New Sloppak" up
+    # front and land in sloppak mode immediately with drum_tab + stems
+    # available. Accepts the audio file as a multipart upload, builds a
+    # minimal one-arrangement sloppak via `_write_sloppak_pak`, and
+    # returns the new filename — the frontend then calls /load_cdlc to
+    # open it in the editor.
+
+    @app.post("/api/plugins/editor/create_sloppak")
+    async def create_sloppak(
+        audio: UploadFile = File(...),
+        metadata: str = Form(...),
+    ):
+        try:
+            meta_in = json.loads(metadata)
+        except json.JSONDecodeError:
+            return JSONResponse({"error": "invalid metadata JSON"}, 400)
+        if not isinstance(meta_in, dict):
+            return JSONResponse({"error": "metadata must be a JSON object"}, 400)
+
+        # Type-guard before .strip(): a malformed payload like
+        # {"title": 123} would otherwise AttributeError → 500. Treat as
+        # a normal bad-request (400) so the strict-validation behavior
+        # is consistent across all fields.
+        def _str_field(name: str, default: str = "") -> str | None:
+            raw = meta_in.get(name, default)
+            if raw is None:
+                raw = default
+            if not isinstance(raw, str):
+                return None
+            return raw.strip()
+
+        title = _str_field("title")
+        if title is None:
+            return JSONResponse({"error": "title must be a string"}, 400)
+        artist = _str_field("artist")
+        if artist is None:
+            return JSONResponse({"error": "artist must be a string"}, 400)
+        if not title:
+            return JSONResponse({"error": "title required"}, 400)
+        if not artist:
+            return JSONResponse({"error": "artist required"}, 400)
+
+        arr_name = _str_field("initial_arrangement", "Lead")
+        if arr_name is None:
+            return JSONResponse(
+                {"error": "initial_arrangement must be a string"}, 400,
+            )
+        if not arr_name:
+            arr_name = "Lead"
+        if arr_name not in ("Lead", "Rhythm", "Bass"):
+            return JSONResponse(
+                {"error": "initial_arrangement must be Lead, Rhythm, or Bass"},
+                400,
+            )
+
+        # Strict length per chosen arrangement. Bass = 4 strings, the
+        # rest = 6. Reject anything else (1, 7, 20, …) so a malformed
+        # client can't accidentally request an extended-range or
+        # truncated arrangement through this entry point. (Extended-
+        # range support exists via the save-as-sloppak path, not here.)
+        expected_strings = 4 if arr_name == "Bass" else 6
+        tuning_in = meta_in.get("tuning")
+
+        def _is_int(v) -> bool:
+            # bool is a subclass of int in Python; treat True/False as
+            # invalid here so a `True → 1` doesn't slip past.
+            return isinstance(v, int) and not isinstance(v, bool)
+
+        if tuning_in is None:
+            tuning = [0] * expected_strings
+        elif isinstance(tuning_in, list) and len(tuning_in) == expected_strings:
+            if not all(_is_int(t) for t in tuning_in):
+                return JSONResponse(
+                    {"error": "tuning entries must be integers (no floats or booleans)"},
+                    400,
+                )
+            tuning = list(tuning_in)
+        else:
+            return JSONResponse(
+                {"error": (
+                    f"tuning must be a list of {expected_strings} ints "
+                    f"for an initial '{arr_name}' arrangement"
+                )},
+                400,
+            )
+
+        capo_raw = meta_in.get("capo", 0)
+        if not _is_int(capo_raw):
+            return JSONResponse(
+                {"error": "capo must be an integer"}, 400,
+            )
+        if capo_raw < 0:
+            return JSONResponse(
+                {"error": "capo must be non-negative"}, 400,
+            )
+        capo = capo_raw
+
+        # Strict bool check — client JSON-derived; the string "false"
+        # would otherwise become truthy and silently enable drum_tab.
+        init_drums_raw = meta_in.get("init_drum_tab", True)
+        if not isinstance(init_drums_raw, bool):
+            return JSONResponse(
+                {"error": "init_drum_tab must be a boolean"}, 400,
+            )
+        init_drums = init_drums_raw
+
+        dlc_dir = get_dlc_dir()
+        if not dlc_dir:
+            return JSONResponse({"error": "DLC folder not configured"}, 500)
+
+        # Cap each side at 64 UTF-8 bytes so a long title/artist can't
+        # push the final filename past the typical 255-byte filesystem
+        # limit. Truncating by code-point count would still blow the
+        # limit on emoji / CJK input (each char is 3-4 bytes).
+        _MAX_FILENAME_PART_BYTES = 64
+
+        def _truncate_utf8(s: str, max_bytes: int) -> str:
+            b = s.encode("utf-8")[:max_bytes]
+            return b.decode("utf-8", "ignore")
+
+        safe_t = _truncate_utf8(
+            re.sub(r'[<>:"/\\|?*]', "_", title), _MAX_FILENAME_PART_BYTES,
+        ).rstrip(". ")
+        safe_a = _truncate_utf8(
+            re.sub(r'[<>:"/\\|?*]', "_", artist), _MAX_FILENAME_PART_BYTES,
+        ).rstrip(". ")
+        if not safe_t or not safe_a:
+            return JSONResponse(
+                {"error": "title and artist must contain non-blank characters"},
+                400,
+            )
+        new_filename = f"{safe_t}_{safe_a}_p.sloppak"
+        output_path = (dlc_dir / new_filename).resolve()
+        # Containment check — the sanitiser above strips path separators,
+        # but defend against a `.. .. ..` -style title that somehow
+        # escapes the regex.
+        try:
+            output_path.relative_to(dlc_dir.resolve())
+        except ValueError:
+            return JSONResponse({"error": "forbidden"}, 403)
+        if output_path.exists():
+            # Distinguish file collision from authoring-form dir
+            # collision (`save_as_sloppak` returns the same 409 with a
+            # similarly-worded directory-specific message). A clearer
+            # error tells the user what they actually need to clean up.
+            if output_path.is_dir():
+                return JSONResponse(
+                    {"error": (
+                        f"A sloppak directory already exists at "
+                        f"{new_filename}. Remove or rename it before "
+                        "creating a new sloppak with this title/artist."
+                    )},
+                    409,
+                )
+            return JSONResponse(
+                {"error": (
+                    f"A file named {new_filename} already exists in the DLC "
+                    "folder. Pick a different title/artist or remove the "
+                    "existing file."
+                )},
+                409,
+            )
+
+        # Save the upload + re-encode to .ogg so the sloppak stem matches
+        # the format the rest of the editor expects (load path decodes
+        # everything to ogg anyway). Wrapped in try/finally so any
+        # exception (audio.read OOM, copy2 disk-full, ffmpeg crash,
+        # write failure) cleans up the temp dir instead of leaking it.
+        upload_dir = Path(tempfile.mkdtemp(prefix="slopsmith_create_sloppak_"))
+        try:
+            # Whitelist the extension before interpolating it into the
+            # temp path. `Path.suffix` returns just the final ".ext"
+            # fragment (no separators), so a hostile filename like
+            # "../../evil.mp3" already resolves to ".mp3" here — but
+            # defence-in-depth: any non-known extension drops to
+            # ".bin" and lets ffmpeg's content-sniff decide the format.
+            _KNOWN_AUDIO_EXTS = {
+                ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus",
+                ".aac", ".aiff", ".wma",
+            }
+            _raw_ext = Path(audio.filename or "audio").suffix.lower()
+            in_ext = _raw_ext if _raw_ext in _KNOWN_AUDIO_EXTS else ".bin"
+            in_path = upload_dir / f"upload{in_ext}"
+            # Stream the upload to disk in chunks instead of slurping the
+            # whole file into memory — a large audio (multi-hundred-MB
+            # FLAC, an hour-long jam) would otherwise risk an OOM here.
+            with in_path.open("wb") as dst:
+                while True:
+                    chunk = await audio.read(64 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+
+            ogg_path = upload_dir / "audio.ogg"
+            if in_ext == ".ogg":
+                # Rename instead of copy — both paths live in the same
+                # upload_dir (deleted at the end), so duplicating the
+                # bytes just doubles peak temp disk for nothing.
+                in_path.rename(ogg_path)
+                # Same min-size sanity check the re-encode branch
+                # enforces — a 0-byte / truncated .ogg would otherwise
+                # produce a sloppak that fails on first open.
+                if (not ogg_path.exists()
+                        or ogg_path.stat().st_size < 100):
+                    return JSONResponse(
+                        {"error": "uploaded .ogg is empty or too small to play"},
+                        400,
+                    )
+            else:
+                from lib.audio import _ffmpeg_cmd, _ffmpeg_wav_to_ogg
+                ffmpeg = _ffmpeg_cmd()
+                if not ffmpeg:
+                    return JSONResponse(
+                        {"error": "ffmpeg not available — can't re-encode audio"},
+                        500,
+                    )
+                try:
+                    r = await asyncio.get_event_loop().run_in_executor(
+                        None, _ffmpeg_wav_to_ogg, ffmpeg, in_path, ogg_path,
+                    )
+                except Exception:
+                    # str(e) on subprocess / OSError commonly embeds the
+                    # ffmpeg cmd line and absolute paths — log it
+                    # server-side and return a generic message.
+                    import logging as _log
+                    _log.getLogger("slopsmith.plugin.editor").exception(
+                        "create_sloppak: ffmpeg re-encode raised",
+                    )
+                    return JSONResponse(
+                        {"error": "audio re-encode failed — see server logs"},
+                        400,
+                    )
+                if (r.returncode != 0 or not ogg_path.exists()
+                        or ogg_path.stat().st_size < 100):
+                    return JSONResponse(
+                        {"error": "ffmpeg failed to decode the uploaded audio"},
+                        400,
+                    )
+
+            # Build the minimal in-memory shapes _write_sloppak_pak expects.
+            arrangements_data = [{
+                "name": arr_name,
+                "tuning": tuning,
+                "capo": capo,
+                "notes": [],
+                "chords": [],
+                "chord_templates": [],
+            }]
+            # Seed a minimal one-measure 4/4 @ 120 BPM grid (downbeat +
+            # three sub-beats + next downbeat = 5 beats). The Tempo Map
+            # editor bails when beats.length < 2 ("No beat grid…"), so
+            # a single downbeat would lock the user out of the very UI
+            # they'd use to fix the grid. The user runs Sync or drags
+            # poles in Tempo Map mode to fit this to the audio.
+            beats = [
+                {"time": 0.0, "measure": 1},
+                {"time": 0.5, "measure": -1},
+                {"time": 1.0, "measure": -1},
+                {"time": 1.5, "measure": -1},
+                {"time": 2.0, "measure": 2},
+            ]
+            sections: list = []
+            # Same type-guard rule as title/artist/initial_arrangement —
+            # writing a non-string/non-scalar into manifest.yaml would
+            # produce a malformed sloppak or break loaders that assume
+            # these fields are scalars. Reject as a 400 (not 500) when
+            # the payload is the wrong shape.
+            album_raw = meta_in.get("album", "")
+            if album_raw is None:
+                album_raw = ""
+            if not isinstance(album_raw, str):
+                return JSONResponse(
+                    {"error": "album must be a string"}, 400,
+                )
+            year_raw = meta_in.get("year", "")
+            if year_raw is None:
+                year_raw = ""
+            # Accept int or string (the create modal sends a number;
+            # the underlying _write_sloppak_pak str()s it either way).
+            # Reject bool explicitly — isinstance(True, int) is True
+            # in Python and we don't want True → "True" in the manifest.
+            if (isinstance(year_raw, bool)
+                    or not isinstance(year_raw, (int, str))):
+                return JSONResponse(
+                    {"error": "year must be a number or string"}, 400,
+                )
+            meta_out = {
+                "title": title,
+                "artist": artist,
+                "album": album_raw,
+                "year": year_raw,
+            }
+
+            drum_tab: dict | None = None
+            if init_drums:
+                from lib import drums as drums_mod
+                drum_tab = {
+                    "version": getattr(drums_mod, "SCHEMA_VERSION", 1),
+                    "name": "Drums",
+                    "kit": [],
+                    "hits": [],
+                }
+
+            # Probe the actual audio duration so the sloppak's
+            # manifest.duration reflects the song, not the 2-second
+            # placeholder beat grid. Best-effort: if the probe fails
+            # we fall through to the (incorrect) beats-derived default
+            # rather than refusing the whole create.
+            audio_duration: float | None = None
+            try:
+                from lib.audio import _bundled_or_path
+                ffprobe = _bundled_or_path("ffprobe") or shutil.which("ffprobe")
+            except Exception:
+                ffprobe = shutil.which("ffprobe")
+            if ffprobe:
+                try:
+                    pr = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: subprocess.run(
+                            [ffprobe, "-v", "error",
+                             "-show_entries", "format=duration",
+                             "-of", "csv=p=0", str(ogg_path)],
+                            capture_output=True, timeout=15,
+                        ),
+                    )
+                    if pr.returncode == 0:
+                        try:
+                            audio_duration = float(pr.stdout.strip())
+                        except (TypeError, ValueError):
+                            audio_duration = None
+                except Exception:
+                    audio_duration = None
+
+            def _do_write():
+                return _write_sloppak_pak(
+                    audio_file=str(ogg_path),
+                    art_path="",
+                    arrangements_data=arrangements_data,
+                    beats=beats,
+                    sections=sections,
+                    meta=meta_out,
+                    output_path=output_path,
+                    drum_tab=drum_tab,
+                    fail_if_exists=True,
+                    duration_override=audio_duration,
+                )
+
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, _do_write,
+                )
+            except FileExistsError as e:
+                # Lost the TOCTOU race; surface as 409.
+                return JSONResponse({"error": str(e)}, 409)
+            except IsADirectoryError:
+                # Authoring-form `*.sloppak/` directory at the target —
+                # _write_sloppak_pak refuses to clobber. Match the
+                # build endpoint's 409 (not 500). str(e) would embed
+                # the absolute output_path, so build the message from
+                # the basename instead to avoid leaking the DLC dir.
+                return JSONResponse(
+                    {"error": (
+                        f"A sloppak directory already exists at "
+                        f"{new_filename}. Remove or rename it before "
+                        "creating a new sloppak with this title/artist."
+                    )},
+                    409,
+                )
+            except Exception:
+                # Log the full traceback server-side so an operator can
+                # diagnose the failure, but DON'T return str(e) to the
+                # client — many filesystem / zip / shutil exceptions
+                # embed absolute paths (DLC dir, temp dir, …) and would
+                # leak local layout via the error response.
+                import logging as _log
+                _log.getLogger("slopsmith.plugin.editor").exception(
+                    "create_sloppak: write failed for %s", new_filename,
+                )
+                return JSONResponse(
+                    {"error": "failed to write the sloppak — see server logs"},
+                    500,
+                )
+
+            # Don't leak the absolute disk path back to the client; the
+            # frontend only needs `filename` to call loadCDLC.
+            return {"success": True, "filename": new_filename}
+        finally:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+
     # ── Upload album art ───────────────────────────────────────────────
 
     @app.post("/api/plugins/editor/upload-art")
@@ -2591,13 +2983,23 @@ def setup(app, context):
 
     def _write_sloppak_pak(*, audio_file: str, art_path: str,
                           arrangements_data: list, beats: list, sections: list,
-                          meta: dict, output_path: Path) -> str:
+                          meta: dict, output_path: Path,
+                          drum_tab: dict | None = None,
+                          fail_if_exists: bool = False,
+                          duration_override: float | None = None) -> str:
         """Stage a sloppak at `output_path` from the in-memory edit state.
 
         Shared between the create-mode build path (output_path derived
         from title/artist) and the save-as-sloppak path (output_path
         derived from the source PSARC filename, so the new sloppak sits
         next to the original on disk).
+
+        Optional `drum_tab`: when provided, written as `drum_tab.json`
+        and referenced from the manifest's top-level `drum_tab:` key.
+        Currently only used by the create-sloppak flow (when the user
+        opts into starting with an empty drum tab); the regular /save
+        path writes drum_tab via its own staging logic, not through
+        this helper.
         """
         if not audio_file or not Path(audio_file).exists():
             raise RuntimeError("No audio file available for sloppak write")
@@ -2634,12 +3036,23 @@ def setup(app, context):
 
             used_ids: set[str] = set()
             manifest_arrangements = []
-            duration = 0.0
-            for b in beats:
-                try:
-                    duration = max(duration, float(b.get("time", 0)))
-                except (TypeError, ValueError):
-                    pass
+            # For create-mode the beats[] is just a placeholder grid
+            # (a few seconds at the head of the song), so max(beats.time)
+            # would write a ~2s manifest.duration regardless of the
+            # actual audio length. Callers that know the real duration
+            # (e.g. create_sloppak, which probes the audio with ffprobe)
+            # pass it via duration_override.
+            if (duration_override is not None
+                    and isinstance(duration_override, (int, float))
+                    and duration_override > 0):
+                duration = float(duration_override)
+            else:
+                duration = 0.0
+                for b in beats:
+                    try:
+                        duration = max(duration, float(b.get("time", 0)))
+                    except (TypeError, ValueError):
+                        pass
 
             for i, ad in enumerate(arrangements_data):
                 name = ad.get("name", f"Arr{i}")
@@ -2708,25 +3121,83 @@ def setup(app, context):
                 shutil.copy2(art_path, staging / cover_name)
                 manifest["cover"] = cover_name
 
+            if isinstance(drum_tab, dict):
+                # Validate the shape via the same permissive validator
+                # the loader uses — refusing now beats writing a manifest
+                # entry that points at a drum_tab.json the loader would
+                # silently drop (leaving the user with a broken file).
+                # NB: validator returns (ok, reason); the previous
+                # `if not validator(...)` check was a no-op because a
+                # 2-tuple is always truthy.
+                from lib import drums as _drums_mod
+                ok, reason = _drums_mod.validate_drum_tab(drum_tab)
+                if not ok:
+                    raise ValueError(
+                        f"drum_tab failed validation: {reason}"
+                    )
+                (staging / "drum_tab.json").write_text(
+                    json.dumps(drum_tab, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                manifest["drum_tab"] = "drum_tab.json"
+
             (staging / "manifest.yaml").write_text(
                 yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True),
                 encoding="utf-8",
             )
 
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            # `fail_if_exists` callers (create-sloppak) want a clear
+            # 409 instead of silently overwriting, even under concurrent
+            # creates. O_CREAT|O_EXCL is the kernel's atomic
+            # "reserve-or-fail" primitive — exactly one concurrent
+            # caller wins, the rest get FileExistsError. We then write
+            # the real zip to a tmp file and rename over our reservation.
+            placeholder_created = False
+            if fail_if_exists:
+                try:
+                    os.close(os.open(
+                        str(output_path),
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        0o644,
+                    ))
+                    placeholder_created = True
+                except FileExistsError:
+                    raise FileExistsError(
+                        f"{output_path.name} already exists; refusing to overwrite"
+                    )
             # Match the existing /save paths: keep a one-time .bak when
             # we're about to overwrite an existing sloppak so the user
-            # has a recovery point.
-            if output_path.exists() and output_path.is_file():
+            # has a recovery point. Skipped on `fail_if_exists` since
+            # we just atomically created a placeholder there.
+            elif output_path.exists() and output_path.is_file():
                 backup = output_path.with_suffix(output_path.suffix + ".bak")
                 if not backup.exists():
                     shutil.copy2(output_path, backup)
             tmp_zip = output_path.with_suffix(output_path.suffix + ".tmp")
-            with zipfile.ZipFile(str(tmp_zip), "w", zipfile.ZIP_DEFLATED) as zf:
-                for f in staging.rglob("*"):
-                    if f.is_file():
-                        zf.write(f, f.relative_to(staging).as_posix())
-            tmp_zip.replace(output_path)
+            try:
+                with zipfile.ZipFile(str(tmp_zip), "w", zipfile.ZIP_DEFLATED) as zf:
+                    for f in staging.rglob("*"):
+                        if f.is_file():
+                            zf.write(f, f.relative_to(staging).as_posix())
+                tmp_zip.replace(output_path)
+            except Exception:
+                # Don't leave the 0-byte placeholder behind if the
+                # zip write or rename fails — the next call would see
+                # it as a "real" existing file. Also clean up the
+                # partial tmp zip so failed attempts don't accumulate.
+                if placeholder_created:
+                    try:
+                        if (output_path.exists()
+                                and output_path.stat().st_size == 0):
+                            output_path.unlink()
+                    except OSError:
+                        pass
+                try:
+                    tmp_zip.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
             return str(output_path)
         finally:
             shutil.rmtree(staging, ignore_errors=True)

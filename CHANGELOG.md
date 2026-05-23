@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-05-23
+
+### Added
+- **Unified "New…" entry point** — the toolbar's *Create* button is
+  now *New…* and opens a format-picker dialog asking "What are you
+  making?" with two options: **Sloppak** (audio + chart, with drums +
+  stems available from the start) and **PSARC** (the classic Rocksmith
+  CDLC path, unchanged). Skips the three-step "create PSARC →
+  save-as-sloppak → +drums" workflow that drummers were stuck with.
+- **New-Sloppak modal** — drag-and-drop (or click-to-pick) an audio
+  file (mp3 / wav / flac / m4a / ogg — re-encoded to .ogg on the
+  server via ffmpeg), enter title / artist / album / year, choose an
+  initial arrangement (Lead / Rhythm / Bass) and optionally
+  pre-initialise an empty drum tab (on by default). The new
+  `POST /api/plugins/editor/create_sloppak` route accepts the audio
+  as multipart, builds a fresh .sloppak via the existing
+  `_write_sloppak_pak` helper (which now optionally writes
+  `drum_tab.json` + manifest entry), and returns the new filename;
+  the editor opens it via the existing load path so the in-memory
+  state initialises identically to a normal sloppak load.
+- The legacy *Save as Sloppak* path remains for converting existing
+  PSARC sessions.
+
 ## [1.3.0] - 2026-05-23
 
 ### Added
