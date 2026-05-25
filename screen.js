@@ -723,12 +723,20 @@ function _drawNote(n, selected) {
     if (techs.hammer_on) badges.push('H');
     if (techs.pull_off) badges.push('P');
     if (techs.slide_to >= 0) badges.push('/' + techs.slide_to);
+    if (techs.slide_unpitch_to >= 0) badges.push('↓' + techs.slide_unpitch_to);
     if (techs.bend > 0) badges.push('b');
     if (techs.harmonic) badges.push('*');
+    if (techs.harmonic_pinch) badges.push('*P');
     if (techs.palm_mute) badges.push('PM');
+    if (techs.fret_hand_mute) badges.push('FM');
     if (techs.tap) badges.push('T');
+    if (techs.slap) badges.push('S');
+    if (techs.pluck) badges.push('P!');
     if (techs.tremolo) badges.push('~');
+    if (techs.vibrato) badges.push('V');
     if (techs.mute) badges.push('x');
+    if (techs.link_next) badges.push('→');
+    if (techs.ignore) badges.push('I');
     if (badges.length) {
         ctx.fillStyle = '#ffffffbb';
         ctx.font = '7px monospace';
@@ -1775,16 +1783,24 @@ function showContextMenu(cx, cy, idx) {
         { label: 'Change Fret...', action: () => promptFret(idx) },
         { label: 'Bend...', action: () => promptBend(idx) },
         { label: 'Slide To...', action: () => promptSlide(idx) },
+        { label: 'Slide Unpitched To...', action: () => promptSlideUnpitch(idx) },
         { label: 'Delete', action: () => { S.history.exec(new DeleteNotesCmd([...S.sel])); draw(); updateStatus(); } },
         { type: 'sep' },
         { label: 'Hammer-On', toggle: 'hammer_on', idx },
         { label: 'Pull-Off', toggle: 'pull_off', idx },
         { label: 'Palm Mute', toggle: 'palm_mute', idx },
+        { label: 'Fret-Hand Mute', toggle: 'fret_hand_mute', idx },
         { label: 'Harmonic', toggle: 'harmonic', idx },
+        { label: 'Pinch Harmonic', toggle: 'harmonic_pinch', idx },
         { label: 'Accent', toggle: 'accent', idx },
         { label: 'Tap', toggle: 'tap', idx },
+        { label: 'Slap', toggle: 'slap', idx },
+        { label: 'Pop (Pluck)', toggle: 'pluck', idx },
         { label: 'Tremolo', toggle: 'tremolo', idx },
+        { label: 'Vibrato', toggle: 'vibrato', idx },
         { label: 'Mute', toggle: 'mute', idx },
+        { label: 'Link Next', toggle: 'link_next', idx },
+        { label: 'Ignore', toggle: 'ignore', idx },
     ];
 
     const n = notes()[idx];
@@ -1824,7 +1840,11 @@ function promptFret(idx) {
     const current = notes()[idx].fret;
     const val = prompt('Fret number (0-24):', current);
     if (val === null) return;
-    const fret = Math.max(0, Math.min(24, parseInt(val) || 0));
+    // Strict-integer parse so `12abc` / `0x10` fall back to 0 instead
+    // of silently truncating to a surprising value. `_parseFretInput`
+    // returns -1 on bad input; clamp to [0, 24] for the fretboard.
+    const parsed = _parseFretInput(val);
+    const fret = Math.max(0, Math.min(24, parsed < 0 ? 0 : parsed));
     S.history.exec(new ChangeFretCmd(idx, fret));
     draw();
 }
@@ -1842,6 +1862,20 @@ function promptBend(idx) {
     draw();
 }
 
+// Parse a `prompt()` fret input strictly: a plain decimal integer
+// (optionally signed). Anything else (`0x10`, `12abc`, `--3`, `1.5`)
+// falls back to `-1`, which the slide setters treat as "no slide".
+// Using a regex rather than raw `parseInt` because `parseInt('12abc')`
+// silently returns `12` and `parseInt('0x10', 10)` silently returns
+// `0`, both of which would be surprising fret values for the user.
+function _parseFretInput(val) {
+    if (val === null || val === undefined) return -1;
+    const m = String(val).trim().match(/^[-+]?\d+$/);
+    if (!m) return -1;
+    const n = Number(m[0]);
+    return Number.isFinite(n) ? n : -1;
+}
+
 function promptSlide(idx) {
     hideContextMenu();
     const n = notes()[idx];
@@ -1850,8 +1884,21 @@ function promptSlide(idx) {
     const val = prompt('Slide to fret (-1 or empty = no slide):', current);
     if (val === null) return;
     if (!n.techniques) n.techniques = {};
-    const fret = parseInt(val);
-    n.techniques.slide_to = isNaN(fret) || fret < 0 ? -1 : Math.min(24, fret);
+    const fret = _parseFretInput(val);
+    n.techniques.slide_to = fret < 0 ? -1 : Math.min(24, fret);
+    draw();
+}
+
+function promptSlideUnpitch(idx) {
+    hideContextMenu();
+    const n = notes()[idx];
+    const techs = n.techniques || {};
+    const current = techs.slide_unpitch_to >= 0 ? techs.slide_unpitch_to : '';
+    const val = prompt('Slide unpitched to fret (-1 or empty = no slide):', current);
+    if (val === null) return;
+    if (!n.techniques) n.techniques = {};
+    const fret = _parseFretInput(val);
+    n.techniques.slide_unpitch_to = fret < 0 ? -1 : Math.min(24, fret);
     draw();
 }
 
