@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
@@ -31,6 +32,14 @@ _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
 # rather than a string avoids a spoofing vector where a client sends the
 # sentinel string value and accidentally (or maliciously) trips the no-op path.
 _DRUM_TAB_ABSENT = object()
+
+# Generic "field absent from request" sentinel used by the save endpoint
+# to distinguish "client didn't send this field" from "client explicitly
+# sent an empty list / null". The empty-list case is meaningful for
+# `anchors_user` (empty → fall back to `_compute_anchors`) and for
+# `handshapes` (empty → no handshapes), so collapsing the two via
+# `dict.get(...) or []` would silently disable both behaviours.
+_FIELD_ABSENT = object()
 
 _sessions = None
 
@@ -95,6 +104,618 @@ def _mix_stems_for_editor(stem_paths: list, dest) -> bool:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+# ── XML / wire helpers ─────────────────────────────────────────────────────
+# Module-level so tests can import them directly. They're pure (only read
+# their params + module-level constants like _YEAR_RE / ET / minidom), so
+# nothing forces them to live inside setup().
+
+
+def _tones_from_old_root(old_root):
+    """Extract `{base, changes, definitions}` from an existing arrangement XML.
+
+    `definitions` always comes through as `[]` here — gear chains live in
+    the PSARC manifest, not the XML. The editor authors names only, so
+    the PSARC manifest's existing tone definitions stay untouched by the
+    save pipeline anyway. Returns None when the source has no tones.
+    """
+    if old_root is None:
+        return None
+    base_el = old_root.find("tonebase")
+    base = base_el.text.strip() if base_el is not None and base_el.text else ""
+    changes = []
+    tones_el = old_root.find("tones")
+    if tones_el is not None:
+        for t in tones_el.findall("tone"):
+            try:
+                time_v = float(t.get("time", "0"))
+            except (TypeError, ValueError):
+                continue
+            name = t.get("name", "")
+            if not name:
+                continue
+            changes.append({"t": time_v, "name": name})
+    if not base and not changes:
+        return None
+    return {"base": base, "changes": changes, "definitions": []}
+
+
+def _handshapes_from_old_root(old_root):
+    """Extract handshapes from the first `<level>` of an existing XML."""
+    if old_root is None:
+        return []
+    level = old_root.find(".//levels/level")
+    if level is None:
+        return []
+    container = level.find("handShapes")
+    if container is None:
+        return []
+    out = []
+    for h in container.findall("handShape"):
+        try:
+            out.append({
+                "chord_id": int(h.get("chordId", -1)),
+                "start_time": float(h.get("startTime", 0)),
+                "end_time": float(h.get("endTime", 0)),
+                "arp": h.get("arpeggio") in ("1", "true", "True"),
+            })
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _safe_int(v, default=-1):
+    """Best-effort int coercion; returns `default` for bad / non-numeric input."""
+    if v is None:
+        return default
+    if isinstance(v, bool):  # bool is a subclass of int — refuse silently
+        return default
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return default
+
+
+def _safe_float(v, default=0.0):
+    """Best-effort float coercion; returns `default` for bad input."""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return default
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_bool(v, default=False):
+    """Coerce a wire-style boolean to a real bool.
+
+    Accepts native `True`/`False`, integer 0/1, and the common string
+    spellings (`"true"`/`"false"`, `"1"`/`"0"`, `"yes"`/`"no"`). Python's
+    built-in `bool("false")` is `True` because the string is non-empty
+    — guard against that pitfall when the value originates from a wire
+    payload or a hand-edited sloppak.
+    """
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes"):
+            return True
+        if s in ("false", "0", "no", ""):
+            return False
+    return default
+
+
+def _valid_anchor_dicts(seq):
+    """Coerce a candidate anchors list into clean {time, fret, width} dicts.
+
+    Drops non-list input, non-dict entries, entries missing required
+    keys, and entries with non-finite or negative `time` (can't legally
+    appear in Rocksmith XML). `fret` is clamped to >= 1 to match
+    `_compute_anchors`; `width` is clamped to >= 1 so a malformed
+    `width=0` can't produce a zero-width anchor. The returned list is
+    time-sorted so downstream consumers see the same ordering whether
+    anchors came from the client or from `_compute_anchors`.
+    """
+    out = []
+    if not isinstance(seq, list):
+        return out
+    for a in seq:
+        if not isinstance(a, dict) or "time" not in a or "fret" not in a:
+            continue
+        try:
+            t = float(a["time"])
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(t) or t < 0:
+            continue
+        try:
+            fret = int(a["fret"])
+            width = int(a.get("width", 4))
+        except (TypeError, ValueError):
+            continue
+        out.append({
+            "time": t,
+            "fret": max(1, fret),
+            "width": max(1, width),
+        })
+    out.sort(key=lambda a: a["time"])
+    return out
+
+
+def _valid_handshape_dicts(seq):
+    """Coerce a candidate handshapes list into clean dicts; drop bad entries.
+
+    A handshape with a missing / negative `chord_id` is dropped rather
+    than kept with the `-1` sentinel — Rocksmith XML treats `chordId`
+    as a non-negative (zero-based) index into `<chordTemplates>`, so
+    emitting `chordId="-1"` would write a malformed handshape into the
+    output. Same idea for `start_time` / `end_time`: non-finite or
+    negative values can't appear in Rocksmith XML, and `end_time <
+    start_time` is structurally invalid (the highway uses the range
+    for chord-shape lifetime). The `arp` flag goes through
+    `_safe_bool` so a wire-style `"false"` / `"0"` doesn't silently
+    become `True` via Python's string truthiness.
+    """
+    out = []
+    if not isinstance(seq, list):
+        return out
+    for h in seq:
+        if not isinstance(h, dict):
+            continue
+        cid = _safe_int(h.get("chord_id"), -1)
+        if cid < 0:
+            continue
+        try:
+            start_t = float(h.get("start_time", 0))
+            end_t = float(h.get("end_time", 0))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(start_t) and math.isfinite(end_t)):
+            continue
+        if start_t < 0 or end_t < 0 or end_t < start_t:
+            continue
+        out.append({
+            "chord_id": cid,
+            "start_time": start_t,
+            "end_time": end_t,
+            "arp": _safe_bool(h.get("arp", h.get("arpeggio", False))),
+        })
+    return out
+
+
+def _compute_anchors(notes, chords):
+    """Auto-generate anchors from note fret positions."""
+    all_fretted = []
+    for n in notes:
+        if n["fret"] > 0:
+            all_fretted.append((n["time"], n["fret"]))
+    for ch in chords:
+        for cn in ch.get("notes", []):
+            if cn["fret"] > 0:
+                all_fretted.append((cn["time"], cn["fret"]))
+
+    all_fretted.sort(key=lambda x: x[0])
+
+    if not all_fretted:
+        return [{"time": 0.0, "fret": 1, "width": 4}]
+
+    anchors = [{
+        "time": 0.0,
+        "fret": max(1, all_fretted[0][1] - 1),
+        "width": 4,
+    }]
+
+    for t, fret in all_fretted:
+        a = anchors[-1]
+        if fret < a["fret"] or fret > a["fret"] + a["width"]:
+            new_fret = max(1, fret - 1)
+            if new_fret != a["fret"]:
+                anchors.append({"time": t, "fret": new_fret, "width": 4})
+
+    return anchors
+
+
+def _arr_dict_to_wire(
+    name, tuning, capo, notes, chords, chord_templates,
+    *, tones=None, handshapes=None, anchors_user=None,
+):
+    """Convert editor's long-named arrangement dict into sloppak wire format.
+
+    Editor uses {time, string, fret, sustain, techniques: {bend, slide_to,
+    ...}}; the wire format uses {t, s, f, sus, sl, bn, ho, ...}.
+
+    `tones` (opaque {base, changes, definitions}) round-trips verbatim
+    through the sloppak loader. `handshapes` / `anchors_user` (when
+    provided) replace the empty defaults the wire emits, so the editor's
+    authored values survive save → reload.
+    """
+    def _note(n):
+        tech = n.get("techniques", {}) or {}
+        out = {
+            "t": round(float(n.get("time", 0)), 3),
+            "s": int(n.get("string", 0)),
+            "f": int(n.get("fret", 0)),
+            "sus": round(float(n.get("sustain", 0)), 3),
+            "sl": _safe_int(tech.get("slide_to"), -1),
+            "slu": _safe_int(tech.get("slide_unpitch_to"), -1),
+            "bn": round(_safe_float(tech.get("bend"), 0.0), 1),
+            # `_safe_bool` so wire-style strings like "false" / "0" can't
+            # silently flip a technique on via Python's string truthiness.
+            "ho": _safe_bool(tech.get("hammer_on")),
+            "po": _safe_bool(tech.get("pull_off")),
+            "hm": _safe_bool(tech.get("harmonic")),
+            "hp": _safe_bool(tech.get("harmonic_pinch")),
+            "pm": _safe_bool(tech.get("palm_mute")),
+            "mt": _safe_bool(tech.get("mute")),
+            "tr": _safe_bool(tech.get("tremolo")),
+            "ac": _safe_bool(tech.get("accent")),
+            "tp": _safe_bool(tech.get("tap")),
+            "ln": _safe_bool(tech.get("link_next")),
+            "vb": _safe_bool(tech.get("vibrato")),
+            "fhm": _safe_bool(tech.get("fret_hand_mute")),
+            "plk": _safe_bool(tech.get("pluck")),
+            "slp": _safe_bool(tech.get("slap")),
+            "rh": _safe_int(tech.get("right_hand"), -1),
+            "pkd": _safe_int(tech.get("pick_direction"), -1),
+            "ig": _safe_bool(tech.get("ignore")),
+        }
+        return out
+
+    def _note_in_chord(n):
+        d = _note(n)
+        d.pop("t", None)
+        return d
+
+    wire = {
+        "name": name,
+        "tuning": list(tuning),
+        "capo": int(capo),
+        "notes": [_note(n) for n in notes],
+        "chords": [
+            {
+                "t": round(float(c.get("time", 0)), 3),
+                "id": int(c.get("chord_id", -1)),
+                "hd": _safe_bool(c.get("high_density")),
+                "notes": [_note_in_chord(cn) for cn in c.get("notes", [])],
+            }
+            for c in chords
+        ],
+        # Mirror `_build_arrangement_xml`'s semantic: when authored anchors
+        # validate to a non-empty list, persist them; otherwise fall back
+        # to `_compute_anchors` so the saved sloppak never ends up with
+        # zero anchors (the highway needs them for fret-hand positioning).
+        "anchors": [
+            {
+                "time": round(a["time"], 3),
+                "fret": a["fret"],
+                "width": a["width"],
+            }
+            for a in (
+                _valid_anchor_dicts(anchors_user)
+                or _compute_anchors(notes, chords)
+            )
+        ],
+        # Drop handshapes whose `chord_id` points past the available
+        # chord templates — mirrors the XML writer's bound and keeps
+        # the sloppak side from persisting an invalid index.
+        "handshapes": [
+            {
+                "chord_id": h["chord_id"],
+                "start_time": round(h["start_time"], 3),
+                "end_time": round(h["end_time"], 3),
+                "arp": h["arp"],
+            }
+            for h in _valid_handshape_dicts(handshapes)
+            if h["chord_id"] < len(chord_templates)
+        ],
+        "templates": [
+            {
+                "name": ct.get("name", ""),
+                "fingers": list(ct.get("fingers", [-1]*6)),
+                "frets": list(ct.get("frets", [-1]*6)),
+            }
+            for ct in chord_templates
+        ],
+    }
+    if tones:
+        wire["tones"] = tones
+    return wire
+
+
+def _note_attrs_xml(n, *, include_time=True):
+    """Build the attribute dict for a single <note>/<chordNote>.
+
+    Shared between top-level <note> and <chordNote> emission so a chord
+    member override (e.g. one bent member of a chord) carries identical
+    technique surface to a standalone note.
+    """
+    techs = n.get("techniques", {}) or {}
+    attrs = {}
+    if include_time:
+        attrs["time"] = f"{n['time']:.3f}"
+    # Use `_safe_bool` so a payload that hand-spells boolean techniques
+    # as "0"/"false" doesn't get coerced to True via Python's string
+    # truthiness and emit an incorrect "1" attribute.
+    def _flag(key):
+        return "1" if _safe_bool(techs.get(key)) else "0"
+    attrs.update({
+        "string": str(n["string"]),
+        "fret": str(n["fret"]),
+        "sustain": f"{n.get('sustain', 0.0):.3f}",
+        "bend": f"{_safe_float(techs.get('bend'), 0.0):.1f}",
+        "hammerOn": _flag("hammer_on"),
+        "pullOff": _flag("pull_off"),
+        "slideTo": str(_safe_int(techs.get("slide_to"), -1)),
+        "slideUnpitchTo": str(_safe_int(techs.get("slide_unpitch_to"), -1)),
+        "harmonic": _flag("harmonic"),
+        "harmonicPinch": _flag("harmonic_pinch"),
+        "palmMute": _flag("palm_mute"),
+        "mute": _flag("mute"),
+        "vibrato": _flag("vibrato"),
+        "tremolo": _flag("tremolo"),
+        "accent": _flag("accent"),
+        "linkNext": _flag("link_next"),
+        "tap": _flag("tap"),
+        "fretHandMute": _flag("fret_hand_mute"),
+        "pluck": _flag("pluck"),
+        "slap": _flag("slap"),
+        "rightHand": str(_safe_int(techs.get("right_hand"), -1)),
+        "pickDirection": str(_safe_int(techs.get("pick_direction"), -1)),
+        "ignore": _flag("ignore"),
+    })
+    return attrs
+
+
+def _build_arrangement_xml(
+    old_root, notes, chords, chord_templates, beats, sections, metadata,
+    force_max_strings=None,
+    *, tones=None, handshapes=None, anchors_user=None,
+):
+    """Build a Rocksmith arrangement XML from editor data.
+
+    `force_max_strings` caps the emitted `<tuning>` width so a PSARC
+    truncate save can't carry over `string6+` slots that may have been
+    written by a prior extended-range save.
+
+    `tones` (shape `{base, changes, definitions}` — definitions opaque,
+    base + changes authored) writes `<tonebase>` and `<tones>` after
+    `<capo>`. `handshapes` replaces the empty default. `anchors_user`,
+    when non-empty, overrides the `_compute_anchors` auto-generation.
+    """
+    root = ET.Element("song", version="7")
+
+    _META_ALIASES = {
+        "title": ("title",),
+        "artistName": ("artistName", "artist"),
+        "albumName": ("albumName", "album"),
+        "albumYear": ("albumYear", "year"),
+        "arrangement": ("arrangement",),
+        "offset": ("offset",),
+        "songLength": ("songLength",),
+        "startBeat": ("startBeat",),
+        "averageTempo": ("averageTempo",),
+    }
+
+    def _text(tag, fallback=""):
+        for k in _META_ALIASES.get(tag, (tag,)):
+            if k in metadata and metadata[k] not in (None, ""):
+                return str(metadata[k])
+        el = old_root.find(tag) if old_root is not None else None
+        return el.text if el is not None and el.text else fallback
+
+    def _year_text():
+        raw = _text("albumYear", "")
+        m = _YEAR_RE.search(raw) if raw else None
+        return m.group(1) if m else ""
+
+    ET.SubElement(root, "title").text = _text("title", "Untitled")
+    ET.SubElement(root, "arrangement").text = _text("arrangement", "Lead")
+    ET.SubElement(root, "offset").text = _text("offset", "0.000")
+    ET.SubElement(root, "songLength").text = _text("songLength", "0.000")
+    ET.SubElement(root, "startBeat").text = _text("startBeat", "0.000")
+    ET.SubElement(root, "averageTempo").text = _text("averageTempo", "120")
+    ET.SubElement(root, "artistName").text = _text("artistName", "Unknown")
+    ET.SubElement(root, "albumName").text = _text("albumName", "")
+    ET.SubElement(root, "albumYear").text = _year_text()
+
+    old_tuning = old_root.find("tuning") if old_root is not None else None
+    tuning_el = ET.SubElement(root, "tuning")
+    max_i = 5
+    if old_tuning is not None:
+        i = 6
+        while old_tuning.get(f"string{i}") is not None:
+            max_i = i
+            i += 1
+    if force_max_strings is not None:
+        max_i = max(5, min(max_i, force_max_strings - 1))
+    for i in range(max_i + 1):
+        val = "0"
+        if old_tuning is not None:
+            val = old_tuning.get(f"string{i}", "0")
+        tuning_el.set(f"string{i}", val)
+
+    old_capo = old_root.find("capo") if old_root is not None else None
+    ET.SubElement(root, "capo").text = (
+        old_capo.text if old_capo is not None and old_capo.text else "0"
+    )
+
+    # Tones — emit `<tonebase>` and `<tones>` only when there's
+    # authored data. Other parts of the XML (note attrs, handshapes,
+    # anchors) already differ from the pre-PR writer because the new
+    # techniques are always emitted; this block stays absent in the
+    # no-tones case so a non-tones arrangement doesn't suddenly grow
+    # an empty `<tones count="0"/>` it never had before.
+    tones_obj = tones or {}
+    base_name = ""
+    changes = []
+    if isinstance(tones_obj, dict):
+        raw_base = tones_obj.get("base")
+        if isinstance(raw_base, str):
+            base_name = raw_base.strip()
+        raw_changes = tones_obj.get("changes") or []
+        for c in raw_changes:
+            if not isinstance(c, dict):
+                continue
+            try:
+                t = float(c.get("t", c.get("time", 0)))
+            except (TypeError, ValueError):
+                continue
+            # Rocksmith tone times are non-negative real numbers; drop
+            # negatives / NaN / ±inf so the writer never emits an
+            # invalid `<tone time="..."/>` that would break downstream
+            # SNG compilers.
+            if not math.isfinite(t) or t < 0:
+                continue
+            name = c.get("name", "")
+            if not isinstance(name, str) or not name:
+                continue
+            changes.append((t, name))
+    if base_name or changes:
+        # `<tonebase>` defaults to "Clean" when the payload doesn't
+        # name one — use the same effective value for the slot-id skip
+        # check, otherwise a `change.name == "Clean"` would slip past
+        # the comparison against the (empty) raw `base_name` and get
+        # assigned a non-base slot id.
+        effective_base = base_name or "Clean"
+        ET.SubElement(root, "tonebase").text = effective_base
+        changes.sort(key=lambda c: c[0])
+        slot_ids = {}
+        for _, name in changes:
+            if name == effective_base:
+                continue
+            if name not in slot_ids:
+                slot_ids[name] = len(slot_ids)
+        tones_el = ET.SubElement(root, "tones", count=str(len(changes)))
+        for t, name in changes:
+            attrs = {"time": f"{t:.3f}", "name": name}
+            if name in slot_ids:
+                attrs["id"] = str(slot_ids[name])
+            ET.SubElement(tones_el, "tone", **attrs)
+
+    ebeats_el = ET.SubElement(root, "ebeats", count=str(len(beats)))
+    for b in beats:
+        ET.SubElement(
+            ebeats_el, "ebeat",
+            time=f"{b['time']:.3f}", measure=str(b["measure"]),
+        )
+
+    if not sections:
+        sections = [{"name": "default", "number": 1, "start_time": 0.0}]
+    sections_el = ET.SubElement(root, "sections", count=str(len(sections)))
+    for s in sections:
+        ET.SubElement(
+            sections_el, "section",
+            name=s["name"], number=str(s["number"]),
+            startTime=f"{s['start_time']:.3f}",
+        )
+
+    phrases_el = ET.SubElement(root, "phrases", count=str(len(sections)))
+    for s in sections:
+        ET.SubElement(
+            phrases_el, "phrase",
+            disparity="0", ignore="0", maxDifficulty="0",
+            name=s["name"], solo="0",
+        )
+
+    phrase_iters = ET.SubElement(
+        root, "phraseIterations", count=str(len(sections))
+    )
+    for i, s in enumerate(sections):
+        ET.SubElement(
+            phrase_iters, "phraseIteration",
+            time=f"{s['start_time']:.3f}", phraseId=str(i),
+        )
+
+    ct_el = ET.SubElement(
+        root, "chordTemplates", count=str(len(chord_templates))
+    )
+    _CT_HARD_CAP = force_max_strings if force_max_strings is not None else 8
+    ct_width = max(
+        6,
+        max((len(ct.get("frets", [])) for ct in chord_templates), default=6),
+        max((len(ct.get("fingers", [])) for ct in chord_templates), default=6),
+    )
+    ct_width = min(ct_width, _CT_HARD_CAP)
+    for ct in chord_templates:
+        attrs = {"chordName": ct.get("name", "")}
+        frets = ct.get("frets", [-1] * ct_width)
+        fingers = ct.get("fingers", [-1] * ct_width)
+        for i in range(ct_width):
+            attrs[f"fret{i}"] = str(frets[i] if i < len(frets) else -1)
+            attrs[f"finger{i}"] = str(fingers[i] if i < len(fingers) else -1)
+        ET.SubElement(ct_el, "chordTemplate", **attrs)
+
+    levels_el = ET.SubElement(root, "levels", count="1")
+    level = ET.SubElement(levels_el, "level", difficulty="0")
+
+    notes_el = ET.SubElement(level, "notes", count=str(len(notes)))
+    for n in notes:
+        ET.SubElement(notes_el, "note", **_note_attrs_xml(n))
+
+    chords_el = ET.SubElement(level, "chords", count=str(len(chords)))
+    for ch in chords:
+        chord_el = ET.SubElement(
+            chords_el, "chord",
+            time=f"{ch['time']:.3f}",
+            chordId=str(ch.get("chord_id", 0)),
+            highDensity="1" if _safe_bool(ch.get("high_density")) else "0",
+            strum="down",
+        )
+        for cn in ch.get("notes", []):
+            ET.SubElement(chord_el, "chordNote", **_note_attrs_xml(cn))
+
+    # Defensively coerce malformed client payloads (`anchors_user:
+    # "foo"`, or a list containing non-dict / missing-key entries) —
+    # `_valid_anchor_dicts` / `_valid_handshape_dicts` drop bad entries
+    # silently rather than 500ing the save.
+    safe_anchors_user = _valid_anchor_dicts(anchors_user)
+    if safe_anchors_user:
+        anchors = safe_anchors_user
+    else:
+        anchors = _compute_anchors(notes, chords)
+    anchors_el = ET.SubElement(level, "anchors", count=str(len(anchors)))
+    for a in anchors:
+        ET.SubElement(
+            anchors_el, "anchor",
+            time=f"{float(a['time']):.3f}",
+            fret=str(int(a["fret"])),
+            width=str(int(a.get("width", 4))),
+        )
+
+    # Constrain `chord_id` to the actual `<chordTemplates>` range —
+    # `_valid_handshape_dicts` only enforces `>= 0`, but emitting a
+    # handshape that points past the end of the templates list would
+    # produce invalid Rocksmith XML.
+    max_chord_id = len(chord_templates) - 1
+    hs_list = [
+        h for h in _valid_handshape_dicts(handshapes)
+        if h["chord_id"] <= max_chord_id
+    ]
+    hs_el = ET.SubElement(level, "handShapes", count=str(len(hs_list)))
+    for h in hs_list:
+        attrs = {
+            "chordId": str(int(h["chord_id"])),
+            "startTime": f"{float(h['start_time']):.3f}",
+            "endTime": f"{float(h['end_time']):.3f}",
+        }
+        if h["arp"]:
+            attrs["arpeggio"] = "1"
+        ET.SubElement(hs_el, "handShape", **attrs)
+
+    xml_str = ET.tostring(root, encoding="unicode")
+    dom = minidom.parseString(xml_str)
+    return dom.toprettyxml(indent="  ", encoding=None)
 
 
 def setup(app, context):
@@ -640,8 +1261,16 @@ def setup(app, context):
                     {"time": a.time, "fret": a.fret, "width": a.width}
                     for a in (arr.anchors or [])
                 ]
+                # Preserve `arp` alongside the legacy fields — `_song_to_dict`
+                # already emitted handshapes with `arp`, so dropping it here
+                # would silently lose arpeggio metadata on sloppak round-trip.
                 arr_data["handshapes"] = [
-                    {"chord_id": h.chord_id, "start_time": h.start_time, "end_time": h.end_time}
+                    {
+                        "chord_id": h.chord_id,
+                        "start_time": h.start_time,
+                        "end_time": h.end_time,
+                        "arp": h.arpeggio,
+                    }
                     for h in (arr.hand_shapes or [])
                 ]
                 if arr.phrases:
@@ -737,6 +1366,19 @@ def setup(app, context):
         chord_templates = data.get("chord_templates", [])
         beats = data.get("beats", [])
         sections = data.get("sections", [])
+        # New arrangement extras — surfaced from the frontend on save. When
+        # `arrangements` (full snapshot) is provided we re-read these from
+        # each entry inside the sloppak builder; the single-arrangement
+        # PSARC save path takes them straight off the request body.
+        # Use the sentinel to distinguish "absent" from "explicitly empty"
+        # — an empty `anchors_user: []` is meaningful (means "fall back to
+        # `_compute_anchors`"), and an empty `handshapes: []` is meaningful
+        # too (means "no handshapes"). Collapsing absent vs empty would
+        # prevent a client from ever clearing the previously-authored
+        # value back to the auto-computed default.
+        tones = data.get("tones", _FIELD_ABSENT)
+        handshapes = data.get("handshapes", _FIELD_ABSENT)
+        anchors_user = data.get("anchors_user", _FIELD_ABSENT)
         # Merge session metadata (album/year captured at PSARC load
         # time) with anything the frontend sent. `_buildSaveBody` ships
         # `{title, artist}` on every save path; this merge keeps the
@@ -936,9 +1578,31 @@ def setup(app, context):
             _force_max = None
             if force_psarc_truncate:
                 _force_max = 4 if is_bass else 6
+            # PSARC save rewrites the XML from scratch. When the client
+            # omits tones/handshapes, preserve whatever the source XML
+            # already had so a no-UI save doesn't silently strip pre-
+            # existing metadata. An explicit empty list IS honoured —
+            # `anchors_user: []` forces `_compute_anchors`, `handshapes:
+            # []` clears handshapes, `tones: null` clears tones.
+            psarc_tones = (
+                _tones_from_old_root(old_root)
+                if tones is _FIELD_ABSENT
+                else tones
+            )
+            psarc_handshapes = (
+                _handshapes_from_old_root(old_root)
+                if handshapes is _FIELD_ABSENT
+                else handshapes
+            )
+            psarc_anchors_user = (
+                [] if anchors_user is _FIELD_ABSENT else anchors_user
+            )
             xml_str = _build_arrangement_xml(
                 old_root, notes, chords, chord_templates, beats, sections, metadata,
                 force_max_strings=_force_max,
+                tones=psarc_tones,
+                handshapes=psarc_handshapes,
+                anchors_user=psarc_anchors_user,
             )
 
             # Write XML
@@ -971,10 +1635,32 @@ def setup(app, context):
             filename = session["filename"]
             output_path = (dlc_dir / filename).resolve()
 
-            # Build the wire JSON for one arrangement, preserving anchors,
-            # handshapes, and phrases from the loaded session (the editor
-            # UI doesn't expose them yet — pass them through verbatim).
+            # Build the wire JSON for one arrangement. Anchors / handshapes /
+            # tones come through the kwargs; phrases stay opaque passthrough
+            # (the editor UI still doesn't author phrase tiers).
             def _build_wire(arr_dict, is_first):
+                # Anchors: prefer the authored `anchors_user` key when
+                # it's present (even if explicitly empty — empty means
+                # "force `_compute_anchors`"); otherwise fall back to
+                # the legacy `anchors` passthrough that older sloppaks
+                # carry.
+                # Handshapes: prefer the explicit `handshapes` key
+                # (empty list means "no handshapes"). When absent we
+                # default to `[]` — the single-arrangement save path's
+                # `edited_dict` always populates `handshapes` from the
+                # `_preserved` on-disk passthrough before reaching this
+                # builder, and full-snapshot saves ship `handshapes`
+                # for every arrangement, so the absent branch only
+                # fires for legacy clients that pre-date handshape
+                # awareness.
+                if "anchors_user" in arr_dict:
+                    authored_anchors = arr_dict["anchors_user"] or []
+                else:
+                    authored_anchors = arr_dict.get("anchors") or []
+                if "handshapes" in arr_dict:
+                    authored_handshapes = arr_dict["handshapes"] or []
+                else:
+                    authored_handshapes = []
                 wire = _arr_dict_to_wire(
                     arr_dict.get("name", "arr"),
                     arr_dict.get("tuning", [0]*6),
@@ -982,9 +1668,10 @@ def setup(app, context):
                     arr_dict.get("notes", []),
                     arr_dict.get("chords", []),
                     arr_dict.get("chord_templates", []),
+                    tones=arr_dict.get("tones"),
+                    handshapes=authored_handshapes,
+                    anchors_user=authored_anchors,
                 )
-                wire["anchors"] = list(arr_dict.get("anchors") or [])
-                wire["handshapes"] = list(arr_dict.get("handshapes") or [])
                 ph = arr_dict.get("phrases")
                 if ph:
                     wire["phrases"] = list(ph)
@@ -1035,11 +1722,31 @@ def setup(app, context):
                     if _old_path_ok:
                         try:
                             _existing = json.loads(_old_path.read_text(encoding="utf-8"))
-                            for _k in ("anchors", "handshapes", "phrases"):
+                            for _k in ("anchors", "handshapes", "phrases", "tones"):
                                 if _k in _existing:
                                     _preserved[_k] = _existing[_k]
                         except (OSError, json.JSONDecodeError):
                             pass
+                # Newly-authored fields override the on-disk passthrough.
+                # Distinguish "client didn't ship the field" (preserve the
+                # value from disk) from "client shipped the field
+                # explicitly empty" (honour the empty — means "clear
+                # handshapes" / "force auto-anchors" / "clear tones").
+                edited_anchors_user = (
+                    _preserved.get("anchors", [])
+                    if anchors_user is _FIELD_ABSENT
+                    else anchors_user
+                )
+                edited_handshapes = (
+                    _preserved.get("handshapes", [])
+                    if handshapes is _FIELD_ABSENT
+                    else handshapes
+                )
+                edited_tones = (
+                    _preserved.get("tones")
+                    if tones is _FIELD_ABSENT
+                    else tones
+                )
                 edited_dict = {
                     "name": old_entry.get("name", ""),
                     "tuning": old_entry.get("tuning", [0]*6),
@@ -1048,8 +1755,10 @@ def setup(app, context):
                     "chords": chords,
                     "chord_templates": chord_templates,
                     "anchors": _preserved.get("anchors", []),
-                    "handshapes": _preserved.get("handshapes", []),
+                    "anchors_user": edited_anchors_user,
+                    "handshapes": edited_handshapes,
                     "phrases": _preserved.get("phrases"),
+                    "tones": edited_tones,
                 }
                 merged_arrangements = []
                 for i, entry in enumerate(old_entries):
@@ -2872,12 +3581,21 @@ def setup(app, context):
                     arr_notes = arr.get("notes", [])
                     arr_chords = arr.get("chords", [])
                     arr_templates = arr.get("chord_templates", [])
+                    arr_tones = arr.get("tones")
+                    arr_handshapes = arr.get("handshapes") or []
+                    arr_anchors_user = arr.get("anchors_user") or []
                 else:
                     arr_notes, arr_chords, arr_templates = [], [], []
+                    arr_tones = None
+                    arr_handshapes = []
+                    arr_anchors_user = []
 
                 xml_str = _build_arrangement_xml(
                     old_root, arr_notes, arr_chords, arr_templates,
                     beats, sections, meta,
+                    tones=arr_tones,
+                    handshapes=arr_handshapes,
+                    anchors_user=arr_anchors_user,
                 )
                 Path(xml_path).write_text(xml_str, encoding="utf-8")
 
@@ -3067,6 +3785,22 @@ def setup(app, context):
                 normalized_tuning = _normalize_tuning_to_count(
                     ad.get("tuning", [0] * 6), real_count,
                 )
+                # Honor authored anchors when the key is present (even
+                # if it's an explicit `[]` — that's "clear authored
+                # anchors, recompute"). Only fall back to the legacy
+                # `anchors` passthrough when `anchors_user` isn't in the
+                # arrangement dict at all.
+                if "anchors_user" in ad:
+                    authored_anchors = ad["anchors_user"] or []
+                else:
+                    authored_anchors = ad.get("anchors") or []
+                # Same key-presence vs explicit-empty distinction for
+                # `handshapes` (empty means "no handshapes") and `tones`
+                # (None means "no authored tones").
+                if "handshapes" in ad:
+                    authored_handshapes = ad["handshapes"] or []
+                else:
+                    authored_handshapes = []
                 wire = _arr_dict_to_wire(
                     name,
                     normalized_tuning,
@@ -3074,6 +3808,9 @@ def setup(app, context):
                     ad.get("notes", []),
                     ad.get("chords", []),
                     ad.get("chord_templates", []),
+                    tones=ad.get("tones"),
+                    handshapes=authored_handshapes,
+                    anchors_user=authored_anchors,
                 )
                 if i == 0:
                     wire["beats"] = [
@@ -3202,66 +3939,10 @@ def setup(app, context):
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
-    def _arr_dict_to_wire(name, tuning, capo, notes, chords, chord_templates):
-        """Convert editor's long-named arrangement dict into sloppak wire format.
-
-        Editor uses {time, string, fret, sustain, techniques: {bend, slide_to,
-        ...}}; the wire format uses {t, s, f, sus, sl, bn, ho, ...}.
-        """
-        def _note(n):
-            tech = n.get("techniques", {}) or {}
-            out = {
-                "t": round(float(n.get("time", 0)), 3),
-                "s": int(n.get("string", 0)),
-                "f": int(n.get("fret", 0)),
-                "sus": round(float(n.get("sustain", 0)), 3),
-                "sl": int(tech.get("slide_to", -1)),
-                "slu": int(tech.get("slide_unpitch_to", -1)),
-                "bn": round(float(tech.get("bend", 0) or 0), 1),
-                "ho": bool(tech.get("hammer_on", False)),
-                "po": bool(tech.get("pull_off", False)),
-                "hm": bool(tech.get("harmonic", False)),
-                "hp": bool(tech.get("harmonic_pinch", False)),
-                "pm": bool(tech.get("palm_mute", False)),
-                "mt": bool(tech.get("mute", False)),
-                "tr": bool(tech.get("tremolo", False)),
-                "ac": bool(tech.get("accent", False)),
-                "tp": bool(tech.get("tap", False)),
-            }
-            return out
-
-        def _note_in_chord(n):
-            # Chord-member notes share the chord's time, so we omit `t`.
-            d = _note(n)
-            d.pop("t", None)
-            return d
-
-        wire = {
-            "name": name,
-            "tuning": list(tuning),
-            "capo": int(capo),
-            "notes": [_note(n) for n in notes],
-            "chords": [
-                {
-                    "t": round(float(c.get("time", 0)), 3),
-                    "id": int(c.get("chord_id", -1)),
-                    "hd": bool(c.get("high_density", False)),
-                    "notes": [_note_in_chord(cn) for cn in c.get("notes", [])],
-                }
-                for c in chords
-            ],
-            "anchors": [],
-            "handshapes": [],
-            "templates": [
-                {
-                    "name": ct.get("name", ""),
-                    "fingers": list(ct.get("fingers", [-1]*6)),
-                    "frets": list(ct.get("frets", [-1]*6)),
-                }
-                for ct in chord_templates
-            ],
-        }
-        return wire
+    # `_arr_dict_to_wire`, `_build_arrangement_xml`, and `_compute_anchors`
+    # live at module scope (above `setup`) so the tests can import them
+    # directly. Callers inside `setup` reference them by name and resolve
+    # through Python's global scope.
 
     def _song_to_dict(song, audio_url):
         """Convert a Song object to JSON-serializable dict."""
@@ -3287,6 +3968,32 @@ def setup(app, context):
             "arrangements": [],
         }
 
+        def _tech_dict(n):
+            # Mirror the Note dataclass surface — every authorable technique
+            # round-trips so the editor can render and re-emit them.
+            return {
+                "bend": n.bend,
+                "slide_to": n.slide_to,
+                "slide_unpitch_to": n.slide_unpitch_to,
+                "hammer_on": n.hammer_on,
+                "pull_off": n.pull_off,
+                "harmonic": n.harmonic,
+                "harmonic_pinch": n.harmonic_pinch,
+                "palm_mute": n.palm_mute,
+                "mute": n.mute,
+                "vibrato": n.vibrato,
+                "tremolo": n.tremolo,
+                "accent": n.accent,
+                "tap": n.tap,
+                "link_next": n.link_next,
+                "fret_hand_mute": n.fret_hand_mute,
+                "pluck": n.pluck,
+                "slap": n.slap,
+                "right_hand": n.right_hand,
+                "pick_direction": n.pick_direction,
+                "ignore": n.ignore,
+            }
+
         for arr in song.arrangements:
             arr_data = {
                 "name": arr.name,
@@ -3295,7 +4002,41 @@ def setup(app, context):
                 "notes": [],
                 "chords": [],
                 "chord_templates": [],
+                # `tones` is opaque {base, changes, definitions} — passes
+                # through verbatim when the source carried it, otherwise
+                # `None` so the frontend can distinguish "no tone data"
+                # from "authored-but-empty". The editor's first author
+                # action seeds a populated dict; without this distinction
+                # a load → save cycle would persist an empty `tones`
+                # block into sloppaks that previously had no `tones` key.
+                "tones": arr.tones if arr.tones else None,
+                "handshapes": [
+                    {
+                        "chord_id": h.chord_id,
+                        "start_time": round(h.start_time, 3),
+                        "end_time": round(h.end_time, 3),
+                        "arp": h.arpeggio,
+                    }
+                    for h in (arr.hand_shapes or [])
+                ],
             }
+            # Loaded anchors become the user-overridable initial set
+            # (`anchors_user`). We ALSO emit the legacy `anchors` field
+            # with the same payload until the editor UI is fully on
+            # `anchors_user` — frontend code paths like the tempo
+            # re-time logic still read `arr.anchors`, and PSARC saves
+            # that flip to sloppak format without a reload would
+            # otherwise lose anchors entirely.
+            anchors_payload = [
+                {
+                    "time": round(a.time, 3),
+                    "fret": a.fret,
+                    "width": a.width,
+                }
+                for a in (arr.anchors or [])
+            ]
+            arr_data["anchors"] = list(anchors_payload)
+            arr_data["anchors_user"] = list(anchors_payload)
 
             for n in arr.notes:
                 arr_data["notes"].append({
@@ -3303,21 +4044,7 @@ def setup(app, context):
                     "string": n.string,
                     "fret": n.fret,
                     "sustain": round(n.sustain, 3),
-                    "techniques": {
-                        "bend": n.bend,
-                        "slide_to": n.slide_to,
-                        "slide_unpitch_to": n.slide_unpitch_to,
-                        "hammer_on": n.hammer_on,
-                        "pull_off": n.pull_off,
-                        "harmonic": n.harmonic,
-                        "harmonic_pinch": n.harmonic_pinch,
-                        "palm_mute": n.palm_mute,
-                        "mute": n.mute,
-                        "tremolo": n.tremolo,
-                        "accent": n.accent,
-                        "tap": n.tap,
-                        "link_next": n.link_next,
-                    },
+                    "techniques": _tech_dict(n),
                 })
 
             for ch in arr.chords:
@@ -3333,20 +4060,7 @@ def setup(app, context):
                         "string": cn.string,
                         "fret": cn.fret,
                         "sustain": round(cn.sustain, 3),
-                        "techniques": {
-                            "bend": cn.bend,
-                            "slide_to": cn.slide_to,
-                            "slide_unpitch_to": cn.slide_unpitch_to,
-                            "hammer_on": cn.hammer_on,
-                            "pull_off": cn.pull_off,
-                            "harmonic": cn.harmonic,
-                            "palm_mute": cn.palm_mute,
-                            "mute": cn.mute,
-                            "tremolo": cn.tremolo,
-                            "accent": cn.accent,
-                            "tap": cn.tap,
-                            "link_next": cn.link_next,
-                        },
+                        "techniques": _tech_dict(cn),
                     })
                 arr_data["chords"].append(chord_data)
 
@@ -3360,270 +4074,6 @@ def setup(app, context):
             result["arrangements"].append(arr_data)
 
         return result
-
-    def _build_arrangement_xml(
-        old_root, notes, chords, chord_templates, beats, sections, metadata,
-        force_max_strings=None,
-    ):
-        """Build a Rocksmith arrangement XML from editor data.
-
-        `force_max_strings` caps the emitted `<tuning>` width so a
-        PSARC truncate save can't carry over `string6+` slots that may
-        have been written by a prior extended-range save — without
-        this, RsCli's SNG compiler would still crash on the saved
-        PSARC even though we trimmed notes/chords/templates first.
-        """
-        root = ET.Element("song", version="7")
-
-        # Friendly key aliases the editor uses in its session metadata, mapped
-        # onto the RS XML tag names. Lets convert-gp's `{title, artist, album,
-        # year}` payload override the original XML even though the XML uses
-        # `albumName` / `albumYear` / `artistName`.
-        _META_ALIASES = {
-            "title": ("title",),
-            "artistName": ("artistName", "artist"),
-            "albumName": ("albumName", "album"),
-            "albumYear": ("albumYear", "year"),
-            "arrangement": ("arrangement",),
-            "offset": ("offset",),
-            "songLength": ("songLength",),
-            "startBeat": ("startBeat",),
-            "averageTempo": ("averageTempo",),
-        }
-
-        def _text(tag, fallback=""):
-            for k in _META_ALIASES.get(tag, (tag,)):
-                if k in metadata and metadata[k] not in (None, ""):
-                    return str(metadata[k])
-            el = old_root.find(tag)
-            return el.text if el is not None and el.text else fallback
-
-        # albumYear must parse as Int32 for RsCli; sanitize away any stray
-        # copyright text that earlier conversions may have written into the
-        # XML, and clamp non-numeric values to empty.
-        def _year_text():
-            raw = _text("albumYear", "")
-            m = _YEAR_RE.search(raw) if raw else None
-            return m.group(1) if m else ""
-
-        ET.SubElement(root, "title").text = _text("title", "Untitled")
-        ET.SubElement(root, "arrangement").text = _text("arrangement", "Lead")
-        ET.SubElement(root, "offset").text = _text("offset", "0.000")
-        ET.SubElement(root, "songLength").text = _text("songLength", "0.000")
-        ET.SubElement(root, "startBeat").text = _text("startBeat", "0.000")
-        ET.SubElement(root, "averageTempo").text = _text("averageTempo", "120")
-        ET.SubElement(root, "artistName").text = _text("artistName", "Unknown")
-        ET.SubElement(root, "albumName").text = _text("albumName", "")
-        ET.SubElement(root, "albumYear").text = _year_text()
-
-        # Tuning — preserve from original. RS schema names string0..string5;
-        # extended-range arrangements (7/8-string guitar imported from GP)
-        # carry string6/string7 too, so copy whatever the source XML had.
-        old_tuning = old_root.find("tuning")
-        tuning_el = ET.SubElement(root, "tuning")
-        max_i = 5
-        if old_tuning is not None:
-            i = 6
-            while old_tuning.get(f"string{i}") is not None:
-                max_i = i
-                i += 1
-        # PSARC truncate path passes force_max_strings so a previously
-        # extended-range source XML can't carry over string6+ even
-        # though we trimmed notes/chords/templates. Always emit at
-        # least string0..string5 — RS XML schema requires those six
-        # slots regardless of role (a 4-string bass writes the upper
-        # two as 0), and dropping them breaks RsCli / downstream
-        # parsers that assume they exist.
-        if force_max_strings is not None:
-            max_i = max(5, min(max_i, force_max_strings - 1))
-        for i in range(max_i + 1):
-            val = "0"
-            if old_tuning is not None:
-                val = old_tuning.get(f"string{i}", "0")
-            tuning_el.set(f"string{i}", val)
-
-        old_capo = old_root.find("capo")
-        ET.SubElement(root, "capo").text = (
-            old_capo.text if old_capo is not None and old_capo.text else "0"
-        )
-
-        # Ebeats
-        ebeats_el = ET.SubElement(root, "ebeats", count=str(len(beats)))
-        for b in beats:
-            ET.SubElement(
-                ebeats_el, "ebeat",
-                time=f"{b['time']:.3f}", measure=str(b["measure"]),
-            )
-
-        # Sections
-        if not sections:
-            sections = [{"name": "default", "number": 1, "start_time": 0.0}]
-        sections_el = ET.SubElement(root, "sections", count=str(len(sections)))
-        for s in sections:
-            ET.SubElement(
-                sections_el, "section",
-                name=s["name"], number=str(s["number"]),
-                startTime=f"{s['start_time']:.3f}",
-            )
-
-        # Phrases — one per section
-        phrases_el = ET.SubElement(root, "phrases", count=str(len(sections)))
-        for s in sections:
-            ET.SubElement(
-                phrases_el, "phrase",
-                disparity="0", ignore="0", maxDifficulty="0",
-                name=s["name"], solo="0",
-            )
-
-        phrase_iters = ET.SubElement(
-            root, "phraseIterations", count=str(len(sections))
-        )
-        for i, s in enumerate(sections):
-            ET.SubElement(
-                phrase_iters, "phraseIteration",
-                time=f"{s['start_time']:.3f}", phraseId=str(i),
-            )
-
-        # Chord templates
-        ct_el = ET.SubElement(
-            root, "chordTemplates", count=str(len(chord_templates))
-        )
-        # Use the max of both `frets` and `fingers` lengths so a
-        # template that has a wider fingers array than frets doesn't
-        # silently drop the extra `fingerN` slots on round-trip.
-        # Clamp to the extended-range ceiling (string0..string7 i.e.
-        # 8-string guitar) so a malformed payload can't blow up the
-        # emitted XML — `force_max_strings` is set by the truncate
-        # path; otherwise use 8 as a hard upper bound matching the
-        # editor's MAX_LANES.
-        _CT_HARD_CAP = force_max_strings if force_max_strings is not None else 8
-        ct_width = max(
-            6,
-            max((len(ct.get("frets", [])) for ct in chord_templates), default=6),
-            max((len(ct.get("fingers", [])) for ct in chord_templates), default=6),
-        )
-        ct_width = min(ct_width, _CT_HARD_CAP)
-        for ct in chord_templates:
-            attrs = {"chordName": ct.get("name", "")}
-            frets = ct.get("frets", [-1] * ct_width)
-            fingers = ct.get("fingers", [-1] * ct_width)
-            for i in range(ct_width):
-                attrs[f"fret{i}"] = str(frets[i] if i < len(frets) else -1)
-                attrs[f"finger{i}"] = str(fingers[i] if i < len(fingers) else -1)
-            ET.SubElement(ct_el, "chordTemplate", **attrs)
-
-        # Single difficulty level
-        levels_el = ET.SubElement(root, "levels", count="1")
-        level = ET.SubElement(levels_el, "level", difficulty="0")
-
-        # Notes
-        notes_el = ET.SubElement(level, "notes", count=str(len(notes)))
-        for n in notes:
-            techs = n.get("techniques", {})
-            attrs = {
-                "time": f"{n['time']:.3f}",
-                "string": str(n["string"]),
-                "fret": str(n["fret"]),
-                "sustain": f"{n.get('sustain', 0.0):.3f}",
-                "bend": f"{techs.get('bend', 0.0):.1f}",
-                "hammerOn": "1" if techs.get("hammer_on") else "0",
-                "pullOff": "1" if techs.get("pull_off") else "0",
-                "slideTo": str(techs.get("slide_to", -1)),
-                "slideUnpitchTo": str(techs.get("slide_unpitch_to", -1)),
-                "harmonic": "1" if techs.get("harmonic") else "0",
-                "harmonicPinch": "1" if techs.get("harmonic_pinch") else "0",
-                "palmMute": "1" if techs.get("palm_mute") else "0",
-                "mute": "1" if techs.get("mute") else "0",
-                "tremolo": "1" if techs.get("tremolo") else "0",
-                "accent": "1" if techs.get("accent") else "0",
-                "linkNext": "1" if techs.get("link_next") else "0",
-                "tap": "1" if techs.get("tap") else "0",
-                "ignore": "0",
-            }
-            ET.SubElement(notes_el, "note", **attrs)
-
-        # Chords
-        chords_el = ET.SubElement(level, "chords", count=str(len(chords)))
-        for ch in chords:
-            chord_el = ET.SubElement(
-                chords_el, "chord",
-                time=f"{ch['time']:.3f}",
-                chordId=str(ch.get("chord_id", 0)),
-                highDensity="1" if ch.get("high_density") else "0",
-                strum="down",
-            )
-            for cn in ch.get("notes", []):
-                techs = cn.get("techniques", {})
-                ET.SubElement(
-                    chord_el, "chordNote",
-                    time=f"{cn['time']:.3f}",
-                    string=str(cn["string"]),
-                    fret=str(cn["fret"]),
-                    sustain=f"{cn.get('sustain', 0.0):.3f}",
-                    bend=f"{techs.get('bend', 0.0):.1f}",
-                    hammerOn="1" if techs.get("hammer_on") else "0",
-                    pullOff="1" if techs.get("pull_off") else "0",
-                    slideTo=str(techs.get("slide_to", -1)),
-                    slideUnpitchTo=str(techs.get("slide_unpitch_to", -1)),
-                    harmonic="1" if techs.get("harmonic") else "0",
-                    harmonicPinch="1" if techs.get("harmonic_pinch") else "0",
-                    palmMute="1" if techs.get("palm_mute") else "0",
-                    mute="1" if techs.get("mute") else "0",
-                    tremolo="1" if techs.get("tremolo") else "0",
-                    accent="1" if techs.get("accent") else "0",
-                    linkNext="1" if techs.get("link_next") else "0",
-                    tap="1" if techs.get("tap") else "0",
-                    ignore="0",
-                )
-
-        # Auto-generate anchors from note positions
-        anchors = _compute_anchors(notes, chords)
-        anchors_el = ET.SubElement(level, "anchors", count=str(len(anchors)))
-        for a in anchors:
-            ET.SubElement(
-                anchors_el, "anchor",
-                time=f"{a['time']:.3f}",
-                fret=str(a["fret"]),
-                width=str(a.get("width", 4)),
-            )
-
-        ET.SubElement(level, "handShapes", count="0")
-
-        # Pretty print
-        xml_str = ET.tostring(root, encoding="unicode")
-        dom = minidom.parseString(xml_str)
-        return dom.toprettyxml(indent="  ", encoding=None)
-
-    def _compute_anchors(notes, chords):
-        """Auto-generate anchors from note fret positions."""
-        all_fretted = []
-        for n in notes:
-            if n["fret"] > 0:
-                all_fretted.append((n["time"], n["fret"]))
-        for ch in chords:
-            for cn in ch.get("notes", []):
-                if cn["fret"] > 0:
-                    all_fretted.append((cn["time"], cn["fret"]))
-
-        all_fretted.sort(key=lambda x: x[0])
-
-        if not all_fretted:
-            return [{"time": 0.0, "fret": 1, "width": 4}]
-
-        anchors = [{
-            "time": 0.0,
-            "fret": max(1, all_fretted[0][1] - 1),
-            "width": 4,
-        }]
-
-        for t, fret in all_fretted:
-            a = anchors[-1]
-            if fret < a["fret"] or fret > a["fret"] + a["width"]:
-                new_fret = max(1, fret - 1)
-                if new_fret != a["fret"]:
-                    anchors.append({"time": t, "fret": new_fret, "width": 4})
-
-        return anchors
 
     def _compile_sng(xml_path):
         """Try to compile XML to SNG via RsCli."""
