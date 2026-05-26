@@ -76,6 +76,12 @@ const TONE_LANE_H = 16;
 const _TONE_SLOT_DEFAULTS = ['Clean', 'Drive', 'Lead', 'Crunch', 'Effect'];
 const _TONE_SLOT_COLORS = ['#7dd3fc', '#f87171', '#fbbf24', '#a78bfa', '#34d399'];
 
+// ─── Anchor-lane constants (PR3d) ──────────────────────────────────
+// Anchor lane lives below the beat bar so its time axis stays
+// aligned with notes and tones. 18px gives enough room for a fret
+// label plus a width-strip visualization.
+const ANCHOR_LANE_H = 18;
+
 const S = {
     // Song data
     title: '', artist: '', sessionId: null, filename: '',
@@ -89,6 +95,10 @@ const S = {
     // selection. `null` means no marker is selected — Del key falls
     // through to the note delete path.
     toneSel: null,
+    // Selected anchor marker — direct ref into the active
+    // arrangement's `arr.anchors_user` array. Same semantics as
+    // `toneSel`. `null` means no anchor is selected.
+    anchorSel: null,
 
     // Drum tab — null until the user adds drums via the +Drums modal, then
     // a dict matching docs/sloppak-spec.md §5.3 ({version,name,kit,hits}).
@@ -272,8 +282,7 @@ function laneToStr(l) { return (lanes() - 1) - l; }
 function strToY(s)   { return laneToY(strToLane(s)); }
 function yToStr(y)   { const l = Math.max(0, Math.min(lanes() - 1, yToLane(y))); return laneToStr(l); }
 function canvasH()   {
-    if (isKeysMode()) return WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H + BEAT_H;
-    return WAVEFORM_H + lanes() * LANE_H + BEAT_H;
+    return _beatBarTopY() + BEAT_H;
 }
 
 // ── Piano roll mode helpers ─────────────────────────────────────────
@@ -500,6 +509,13 @@ function draw() {
         drawNotes(w);
         drawSelectionRect(w);
         drawGhostNotes();
+        drawAnchorLane(w);
+        // Draw cursor AFTER the anchor lane so the playhead line
+        // appears on top of the lane instead of getting overdrawn —
+        // the cursor's time-axis extent intentionally spans every
+        // strip that shares the time axis (lanes, beat bar, anchor
+        // lane). Tone lane sits at y=0 above the cursor's start, so
+        // it doesn't need similar reordering.
         drawCursor(w, h);
         drawLabels(w);
     } finally {
@@ -612,8 +628,18 @@ function drawSections(w) {
     }
 }
 
+// Y coordinate of the beat bar's top edge. Branches on keys mode
+// because keys lanes use a different per-lane height. `canvasH`,
+// `_anchorLaneTopY`, `drawBeatBar` all call through here so they
+// can't drift as new strips are added.
+function _beatBarTopY() {
+    return isKeysMode()
+        ? WAVEFORM_H + pianoLaneCount() * PIANO_LANE_H
+        : WAVEFORM_H + lanes() * LANE_H;
+}
+
 function drawBeatBar(w) {
-    const y = WAVEFORM_H + lanes() * LANE_H;
+    const y = _beatBarTopY();
     ctx.fillStyle = '#08081a';
     ctx.fillRect(0, y, w, BEAT_H);
     ctx.fillStyle = '#08081a';
@@ -813,7 +839,11 @@ function drawCursor(w, h) {
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(x, 0);
-    ctx.lineTo(x, canvasH());
+    // Extend the playhead through every time-axis-aligned strip
+    // (waveform, tone lane, lanes, beat bar, anchor lane). `canvasH()`
+    // stops at the beat-bar bottom, which would clip the cursor above
+    // the anchor lane.
+    ctx.lineTo(x, h);
     ctx.stroke();
 }
 
@@ -1283,6 +1313,13 @@ function onMouseDown(e) {
     if (y >= 0 && y < TONE_LANE_H && S.arrangements && S.arrangements.length) {
         if (onToneLaneMouseDown(e, x)) return;
     }
+    // Anchor lane sits below the beat bar.
+    if (S.arrangements && S.arrangements.length) {
+        const anchorTop = _anchorLaneTopY();
+        if (y >= anchorTop && y < anchorTop + ANCHOR_LANE_H) {
+            if (onAnchorLaneMouseDown(e, x, y)) return;
+        }
+    }
     // Click outside the tone lane → clear the tone selection so the
     // next Del press targets the note path instead of the previously
     // selected tone marker.
@@ -1290,6 +1327,11 @@ function onMouseDown(e) {
         S.toneSel = null;
         // No explicit `draw()` here — the surrounding mouse-down path
         // already triggers one for the new interaction.
+    }
+    // Same story for anchor selection — a stale `S.anchorSel` would
+    // otherwise hijack the next Del press from the note delete path.
+    if (S.anchorSel !== null) {
+        S.anchorSel = null;
     }
 
     // Left button
@@ -1398,6 +1440,10 @@ function _onMouseMoveBody(e, x, y, L) {
     // drag-handler branches so the marker tracks the cursor.
     if (S.drag && S.drag.type === 'tone') {
         onToneLaneMouseMove(e, x);
+        return;
+    }
+    if (S.drag && S.drag.type === 'anchor') {
+        onAnchorLaneMouseMove(e, x);
         return;
     }
 
@@ -1519,6 +1565,11 @@ function onMouseUp(e) {
         return;
     }
 
+    if (S.drag.type === 'anchor') {
+        onAnchorLaneMouseUp();
+        return;
+    }
+
     if (S.drag.type === 'resize') {
         const nn = notes();
         const finalSustain = nn[S.drag.noteIdx].sustain;
@@ -1631,6 +1682,13 @@ function onContextMenu(e) {
     if (y >= 0 && y < TONE_LANE_H && S.arrangements && S.arrangements.length) {
         if (onToneLaneContextMenu(e, x)) return;
     }
+    // Anchor-lane right-click — edit-fret/width + delete.
+    if (S.arrangements && S.arrangements.length) {
+        const anchorTop = _anchorLaneTopY();
+        if (y >= anchorTop && y < anchorTop + ANCHOR_LANE_H) {
+            if (onAnchorLaneContextMenu(e, x, y)) return;
+        }
+    }
 
     // Right-click on beat bar or lanes with no note = section menu
     const beatBarY = isKeysMode()
@@ -1742,6 +1800,20 @@ function onKeyDown(e) {
             e.preventDefault();
             _tempoDeleteSyncPoint(S.tempoSel);
             return;
+        }
+        // Anchor-lane: delete the selected anchor. Same focus / mode
+        // gates as the tone-lane Del path.
+        if (S.anchorSel && !S.drumEditMode && !S.tempoMapMode &&
+                !e.target.matches('input, select, textarea')) {
+            const arr = _currentAnchorArr();
+            if (arr && Array.isArray(arr.anchors_user)
+                    && arr.anchors_user.includes(S.anchorSel)) {
+                e.preventDefault();
+                S.history.exec(new RemoveAnchorCmd(S.currentArr, S.anchorSel));
+                S.anchorSel = null;
+                draw();
+                return;
+            }
         }
         // Tone-lane: delete the selected tone-change marker. Same
         // input-focus guard as the note-delete path below. Skip when
@@ -2282,6 +2354,7 @@ async function loadCDLC(filename) {
         S.currentArr = 0;
         S.sel.clear();
         S.toneSel = null;
+        S.anchorSel = null;
         S.scrollX = 0;
         S.cursorTime = 0;
         S.history = new EditHistory();
@@ -2585,7 +2658,11 @@ function _buildSaveBody(forceFullSnapshot) {
         // empty `{base, slots, changes, definitions}` dict on the
         // next sloppak save.
         body.arrangements = S.arrangements.map(a => {
-            if (!a || !a.tones) return a;
+            if (!a) return a;
+            // Strip `_anchorEditCount` from every arrangement so the
+            // counter never leaks to the backend's wire format.
+            const { _anchorEditCount, ...rest } = a;
+            if (!rest.tones) return rest;
             // Distinguish loaded-but-unauthored data (ship verbatim,
             // round-trip through sloppak) from a synthesized-then-
             // fully-undone state (strip so the backend's preserve
@@ -2597,12 +2674,12 @@ function _buildSaveBody(forceFullSnapshot) {
             //     → strip the field; the empty object would
             //     otherwise overwrite a `tones: null` sentinel on
             //     disk.
-            const editCount = a.tones._editCount;
+            const editCount = rest.tones._editCount;
             if (editCount === 0) {
-                const { tones, ...rest } = a;
-                return rest;
+                const { tones, ...rest2 } = rest;
+                return rest2;
             }
-            return { ...a, tones: _stripToneInternals(a.tones) };
+            return { ...rest, tones: _stripToneInternals(rest.tones) };
         });
     } else if (_tonesAreDirty(arr)) {
         // Single-arrangement (PSARC) save — the backend reads
@@ -2611,6 +2688,14 @@ function _buildSaveBody(forceFullSnapshot) {
         // state returns the count to 0 → omit the field and let
         // the backend's preserve-from-disk branch fire.
         body.tones = _stripToneInternals(arr.tones);
+    }
+    // PR3d: ship `anchors_user` for single-arr PSARC saves when
+    // the user has authored anchors this session. Full-snapshot
+    // sloppak saves ride through `body.arrangements[i].anchors_user`
+    // already (every arrangement object carries it intact).
+    if (S.format !== 'sloppak' && !forceFullSnapshot
+            && _anchorsAreDirty(arr) && Array.isArray(arr.anchors_user)) {
+        body.anchors_user = arr.anchors_user;
     }
     // Drum-tab payload — separate from arrangements (see sloppak-spec §5.3).
     // S.drumTab is null while the sloppak has none; after +Drums it holds the
@@ -3061,7 +3146,9 @@ function resizeCanvas() {
     const minBeat = 20, minWave = 50;
     BEAT_H = Math.max(minBeat, Math.floor(h * 0.05));
     WAVEFORM_H = Math.max(minWave, Math.floor(h * 0.12));
-    LANE_H = Math.max(30, Math.floor((h - WAVEFORM_H - BEAT_H) / lanes()));
+    // Reserve `ANCHOR_LANE_H` for the anchor strip below the beat bar
+    // so the lanes still fill the remaining vertical space.
+    LANE_H = Math.max(30, Math.floor((h - WAVEFORM_H - BEAT_H - ANCHOR_LANE_H) / lanes()));
 
     canvas.width = w * DPR;
     canvas.height = h * DPR;
@@ -3165,10 +3252,11 @@ window.editorNudgeOffset = (delta) => {
 window.editorSelectArrangement = (val) => {
     S.currentArr = parseInt(val) || 0;
     S.sel.clear();
-    // Tone selection is per-arrangement — clear it so Del after the
-    // switch doesn't remove a same-index marker in the new
-    // arrangement that the user never touched.
+    // Tone + anchor selections are per-arrangement — clear them so
+    // Del after the switch doesn't remove a same-ref marker in the
+    // new arrangement.
     S.toneSel = null;
+    S.anchorSel = null;
     flattenChords();
     if (isKeysMode()) updatePianoRange();
     draw();
@@ -4018,6 +4106,7 @@ window.editorDoCreate = async () => {
         S.currentArr = 0;
         S.sel.clear();
         S.toneSel = null;
+        S.anchorSel = null;
         S.scrollX = 0;
         S.cursorTime = 0;
         S.history = new EditHistory();
@@ -4101,6 +4190,13 @@ window.editorBuild = async () => {
             chord_templates: arr.chord_templates,
         };
         if (buildTones) arrEntry.tones = buildTones;
+        // PR3d: include authored anchors too — same dirty-gate as
+        // tones so an unauthored build doesn't ship empties. The
+        // `_anchorEditCount` counter lives on `arr`, not on the
+        // entry built above, so nothing extra to strip here.
+        if (_anchorsAreDirty(arr) && Array.isArray(arr.anchors_user)) {
+            arrEntry.anchors_user = arr.anchors_user;
+        }
         allArrangements.push(arrEntry);
     }
     S.currentArr = savedArr;
@@ -6504,6 +6600,13 @@ function _applyTempoRemap(remap, scope, arrs) {
         for (const a of (arr.anchors || [])) {
             if (typeof a.time === 'number') a.time = _r3(remap(a.time));
         }
+        // PR3d: the authored anchor list lives in `arr.anchors_user`
+        // and is what the backend ships when non-empty. Remap it
+        // alongside the legacy `arr.anchors` so an "all"-scope tempo
+        // edit doesn't leave the two lists out of sync.
+        for (const a of (arr.anchors_user || [])) {
+            if (typeof a.time === 'number') a.time = _r3(remap(a.time));
+        }
         for (const hs of (arr.handshapes || [])) {
             // Wire fields are start_time / end_time (lib/song.py
             // hand_shape_to_wire) — not the camelCase note fields.
@@ -6543,6 +6646,7 @@ function _captureScopedTimes(scope, arrs) {
                     notes: (ch.notes || []).map(cn => ({ ref: cn, time: cn.time, sustain: cn.sustain })),
                 })),
                 anchors: (arr.anchors || []).map(a => ({ ref: a, time: a.time })),
+                anchors_user: (arr.anchors_user || []).map(a => ({ ref: a, time: a.time })),
                 handshapes: (arr.handshapes || []).map(hs => ({
                     ref: hs, start_time: hs.start_time, end_time: hs.end_time,
                 })),
@@ -6578,6 +6682,11 @@ function _restoreScopedTimes(snap, scope) {
                 }
             }
             for (const e of a.anchors) { if (e.ref) e.ref.time = e.time; }
+            // PR3d: restore the authored anchor list too (was
+            // snapshotted alongside `anchors` above).
+            if (a.anchors_user) {
+                for (const e of a.anchors_user) { if (e.ref) e.ref.time = e.time; }
+            }
             for (const e of a.handshapes) {
                 if (!e.ref) continue;
                 if (e.start_time !== undefined) e.ref.start_time = e.start_time;
@@ -7272,6 +7381,11 @@ class RenameToneSlotsCmd {
 function onToneLaneMouseDown(e, x) {
     const arr = _currentToneArr();
     if (!arr) return false;
+    // Mutually exclusive selection across timeline lanes — without
+    // this clear, `S.anchorSel` would survive a tone-lane click and
+    // the Del handler (which checks anchor first) would delete the
+    // stale anchor instead of the just-clicked tone marker.
+    S.anchorSel = null;
     const hit = _hitToneMarker(x);
     if (hit) {
         S.toneSel = hit;
@@ -7358,6 +7472,10 @@ function onToneLaneContextMenu(e, x) {
     if (!arr) return false;
     const change = _hitToneMarker(x);
     if (!change) return false;
+    // Clear the anchor selection while interacting with a tone marker
+    // so a subsequent Del hits the right path. Mirrors the mousedown
+    // mutual-exclusion above.
+    S.anchorSel = null;
     // Capture the arrangement index NOW. If the user switches
     // arrangements while the context menu is open, a later
     // `S.currentArr` read inside the click handlers would dispatch
@@ -7583,6 +7701,387 @@ function _editorConfirmToneDefinitions() {
         'Tone slots without gear definitions:\n  ' + list + '\n\n' +
         'They will fall back to stock clean in the built PSARC. Continue?',
     );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Anchor lane — PR3d of the tones+notation UI follow-up.
+//
+// Renders fret-position anchors on a thin strip just below the beat
+// bar. Authoring lets the user override the editor's auto-anchor
+// computation; the backend honours `arr.anchors_user` when non-empty
+// and falls back to `_compute_anchors` otherwise (see PR1B / #34).
+// ════════════════════════════════════════════════════════════════════
+
+// Read-only projection of an arrangement's anchors. When
+// `arr.anchors_user` is non-empty, that's the active authored list.
+// When empty (or absent), the backend re-computes anchors from
+// notes/chords on save, so we render the legacy `arr.anchors`
+// passthrough as a dimmed preview of what'll be regenerated.
+// `isAuto` lets the caller distinguish for rendering + decide
+// whether to "promote" an anchor into `anchors_user` on interaction.
+function _readAnchorSnapshot(arr) {
+    if (!arr) return { list: [], isAuto: false };
+    const userList = Array.isArray(arr.anchors_user) ? arr.anchors_user : null;
+    if (userList && userList.length > 0) {
+        return { list: userList, isAuto: false };
+    }
+    const autoList = Array.isArray(arr.anchors) ? arr.anchors : [];
+    return { list: autoList, isAuto: true };
+}
+
+function _currentAnchorArr() {
+    if (!S.arrangements || !S.arrangements[S.currentArr]) return null;
+    return S.arrangements[S.currentArr];
+}
+
+// Ensure `arr.anchors_user` exists for authoring. Only seeds the
+// array — the dirty counter lives on `arr` itself (set by
+// `_bumpAnchorsDirty`, not here) so load-time `_song_to_dict`
+// passthroughs that already shipped an `anchors_user` aren't
+// flagged as authored.
+function _ensureAnchors(arr) {
+    if (!arr) return null;
+    if (!Array.isArray(arr.anchors_user)) arr.anchors_user = [];
+    return arr.anchors_user;
+}
+
+// Edit counter lives on `arr` rather than `arr.anchors_user` so a
+// load that synthesised `anchors_user = []` via `_ensureAnchors`
+// doesn't get spuriously flagged as authored, AND the JSON
+// serialisation paths below explicitly strip `_anchorEditCount` from
+// the wire body so the counter never leaks to the backend.
+function _bumpAnchorsDirty(arr, delta) {
+    if (!arr) return;
+    _ensureAnchors(arr);
+    const next = (arr._anchorEditCount || 0) + delta;
+    arr._anchorEditCount = next > 0 ? next : 0;
+}
+
+function _anchorsAreDirty(arr) {
+    return !!(arr && (arr._anchorEditCount || 0) > 0);
+}
+
+function _anchorLaneTopY() {
+    // Anchor lane sits right below the beat bar — reuse the shared
+    // `_beatBarTopY()` so it stays in sync with keys vs guitar mode
+    // (and with whatever else uses the beat-bar Y).
+    return _beatBarTopY() + BEAT_H;
+}
+
+// ─── Lane drawing ───────────────────────────────────────────────────
+
+function drawAnchorLane(w) {
+    const arr = _currentAnchorArr();
+    if (!arr) return;
+    const top = _anchorLaneTopY();
+    const snap = _readAnchorSnapshot(arr);
+
+    // Lane background.
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, top, w, ANCHOR_LANE_H);
+    ctx.strokeStyle = '#1f2937';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, top + 0.5);
+    ctx.lineTo(w, top + 0.5);
+    ctx.stroke();
+
+    // Left label.
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = 'bold 9px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('anchors', 4, top + ANCHOR_LANE_H / 2);
+
+    const { list, isAuto } = snap;
+    // Auto-fallback list renders dimmed so the user can see what the
+    // backend will recompute. Clicking an auto marker promotes it
+    // into `arr.anchors_user` (see `onAnchorLaneMouseDown`).
+    const fillColor = isAuto ? '#475569' : '#a3e635';
+    const selColor = '#fbbf24';
+    const textColor = isAuto ? '#64748b' : '#a3e635';
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(LABEL_W, top, Math.max(0, w - LABEL_W), ANCHOR_LANE_H);
+    ctx.clip();
+    for (let i = 0; i < list.length; i++) {
+        const a = list[i];
+        if (!a || typeof a.time !== 'number' || !isFinite(a.time)) continue;
+        const x = timeToX(a.time);
+        if (x < -40 || x > w + 40) continue;
+        const fret = Number.isFinite(a.fret) ? a.fret : 1;
+        const width = Number.isFinite(a.width) ? a.width : 4;
+        const sel = !isAuto && S.anchorSel === a;
+        ctx.fillStyle = sel ? selColor : fillColor;
+        ctx.beginPath();
+        ctx.moveTo(x, top + 2);
+        ctx.lineTo(x + 4, top + 6);
+        ctx.lineTo(x - 4, top + 6);
+        ctx.closePath();
+        ctx.fill();
+        if (sel) {
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
+        ctx.fillStyle = sel ? selColor : textColor;
+        ctx.font = '9px monospace';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`${fret}+${width}`, x + 5, top + ANCHOR_LANE_H / 2 + 2);
+    }
+    ctx.restore();
+}
+
+// Returns `{ anchor, isAuto }` for the nearest marker, or `null`.
+// `isAuto = true` means the hit object lives in `arr.anchors` (the
+// auto-fallback list), not in `arr.anchors_user` — interaction
+// callers need to promote it into the user list before mutating.
+function _hitAnchorMarker(x, y) {
+    const arr = _currentAnchorArr();
+    if (!arr) return null;
+    const top = _anchorLaneTopY();
+    if (y < top || y >= top + ANCHOR_LANE_H) return null;
+    const snap = _readAnchorSnapshot(arr);
+    const HIT = 6;
+    let best = null, bestDx = Infinity;
+    for (const a of snap.list) {
+        if (!a || typeof a.time !== 'number' || !isFinite(a.time)) continue;
+        const dx = Math.abs(timeToX(a.time) - x);
+        if (dx <= HIT && dx < bestDx) { best = a; bestDx = dx; }
+    }
+    if (!best) return null;
+    return { anchor: best, isAuto: snap.isAuto };
+}
+
+// Promote an auto-fallback anchor into `arr.anchors_user` by
+// inserting a freshly-allocated copy via `AddAnchorCmd`. Returns the
+// promoted ref so callers can use it for selection / drag. Idempotent
+// for already-authored markers (returns the input as-is).
+function _promoteAnchor(arr, anchor, isAuto) {
+    if (!arr || !anchor) return anchor;
+    if (!isAuto) return anchor;
+    const copy = {
+        time: typeof anchor.time === 'number' ? anchor.time : 0,
+        fret: Number.isFinite(anchor.fret) ? anchor.fret : 1,
+        width: Number.isFinite(anchor.width) ? anchor.width : 4,
+    };
+    S.history.exec(new AddAnchorCmd(S.currentArr, copy));
+    return copy;
+}
+
+// ─── Cmd classes ────────────────────────────────────────────────────
+
+class AddAnchorCmd {
+    constructor(arrIdx, anchor) {
+        this.arrIdx = arrIdx; this.anchor = anchor;
+    }
+    exec() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        _bumpAnchorsDirty(arr, +1);
+        arr.anchors_user.push(this.anchor);
+        arr.anchors_user.sort((a, b) => a.time - b.time);
+    }
+    rollback() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr || !Array.isArray(arr.anchors_user)) return;
+        _bumpAnchorsDirty(arr, -1);
+        const i = arr.anchors_user.indexOf(this.anchor);
+        if (i >= 0) arr.anchors_user.splice(i, 1);
+    }
+}
+
+class RemoveAnchorCmd {
+    constructor(arrIdx, anchor) {
+        this.arrIdx = arrIdx; this.anchor = anchor;
+    }
+    exec() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr || !Array.isArray(arr.anchors_user)) return;
+        _bumpAnchorsDirty(arr, +1);
+        const i = arr.anchors_user.indexOf(this.anchor);
+        if (i >= 0) arr.anchors_user.splice(i, 1);
+    }
+    rollback() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        _bumpAnchorsDirty(arr, -1);
+        _ensureAnchors(arr);
+        arr.anchors_user.push(this.anchor);
+        arr.anchors_user.sort((a, b) => a.time - b.time);
+    }
+}
+
+class MoveAnchorCmd {
+    constructor(arrIdx, anchor, oldTime, newTime) {
+        this.arrIdx = arrIdx; this.anchor = anchor;
+        this.oldTime = oldTime; this.newTime = newTime;
+    }
+    exec() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        _bumpAnchorsDirty(arr, +1);
+        this.anchor.time = this.newTime;
+        arr.anchors_user.sort((a, b) => a.time - b.time);
+    }
+    rollback() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        _bumpAnchorsDirty(arr, -1);
+        this.anchor.time = this.oldTime;
+        arr.anchors_user.sort((a, b) => a.time - b.time);
+    }
+}
+
+class EditAnchorFretWidthCmd {
+    constructor(arrIdx, anchor, oldFret, oldWidth, newFret, newWidth) {
+        this.arrIdx = arrIdx; this.anchor = anchor;
+        this.oldFret = oldFret; this.oldWidth = oldWidth;
+        this.newFret = newFret; this.newWidth = newWidth;
+    }
+    exec() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        _bumpAnchorsDirty(arr, +1);
+        this.anchor.fret = this.newFret;
+        this.anchor.width = this.newWidth;
+    }
+    rollback() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        _bumpAnchorsDirty(arr, -1);
+        this.anchor.fret = this.oldFret;
+        this.anchor.width = this.oldWidth;
+    }
+}
+
+// ─── Mouse interactions ─────────────────────────────────────────────
+
+function onAnchorLaneMouseDown(e, x, y) {
+    const arr = _currentAnchorArr();
+    if (!arr) return false;
+    // Mutually exclusive with the tone-lane selection — see the
+    // matching note in `onToneLaneMouseDown`.
+    S.toneSel = null;
+    const hit = _hitAnchorMarker(x, y);
+    if (hit) {
+        // Auto-fallback hits get promoted into `arr.anchors_user` so
+        // subsequent select / drag / Del semantics work against the
+        // authored list. Already-authored hits pass through.
+        const target = _promoteAnchor(arr, hit.anchor, hit.isAuto);
+        S.anchorSel = target;
+        S.drag = {
+            type: 'anchor',
+            startX: x,
+            origTime: target.time,
+            anchor: target,
+        };
+        draw();
+        return true;
+    }
+    // Empty area click — place a new anchor at the snapped time with
+    // a sensible default (fret 1, width 4). The right-click context
+    // menu lets the user edit fret/width afterwards.
+    const t = snapTime(Math.max(0, xToTime(x)));
+    if (t < 0) return false;
+    const anchor = { time: t, fret: 1, width: 4 };
+    S.history.exec(new AddAnchorCmd(S.currentArr, anchor));
+    S.anchorSel = anchor;
+    draw();
+    return true;
+}
+
+function onAnchorLaneMouseMove(e, x) {
+    if (!S.drag || S.drag.type !== 'anchor') return false;
+    const arr = _currentAnchorArr();
+    if (!arr) return false;
+    // Same perf trick as the tone-lane drag — update `.time` in-place
+    // for live feedback; defer the sort to mouseup (MoveAnchorCmd).
+    S.drag.anchor.time = snapTime(Math.max(0, xToTime(x)));
+    S.anchorSel = S.drag.anchor;
+    draw();
+    return true;
+}
+
+function onAnchorLaneMouseUp() {
+    if (!S.drag || S.drag.type !== 'anchor') return false;
+    const anchor = S.drag.anchor;
+    const origTime = S.drag.origTime;
+    const newTime = anchor.time;
+    S.drag = null;
+    if (origTime !== newTime) {
+        const arr = _currentAnchorArr();
+        if (arr) {
+            anchor.time = origTime;
+            S.history.exec(new MoveAnchorCmd(S.currentArr, anchor, origTime, newTime));
+        }
+    }
+    draw();
+    return true;
+}
+
+function onAnchorLaneContextMenu(e, x, y) {
+    const arr = _currentAnchorArr();
+    if (!arr) return false;
+    const raw = _hitAnchorMarker(x, y);
+    if (!raw) return false;
+    // Promote first so the edit/delete commands operate on a member
+    // of `arr.anchors_user` (the authored list). Without promotion
+    // the commands would mutate an `arr.anchors` ref that the save
+    // path doesn't ship.
+    const hit = _promoteAnchor(arr, raw.anchor, raw.isAuto);
+    // Clear the tone selection while interacting with an anchor —
+    // mirrors the tone-lane context menu's clear above.
+    S.toneSel = null;
+    const menuArrIdx = S.currentArr;
+    const menu = document.getElementById('editor-context-menu');
+    menu.replaceChildren();
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'w-full text-left px-3 py-1 text-xs hover:bg-dark-500';
+    editBtn.textContent = `Edit fret/width (currently ${hit.fret}+${hit.width})`;
+    editBtn.onclick = () => {
+        hideContextMenu();
+        const fretStr = prompt('Anchor fret (1–24):', String(hit.fret));
+        if (fretStr === null) return;
+        const widthStr = prompt('Anchor width (frets, 1–24):', String(hit.width));
+        if (widthStr === null) return;
+        // Strict-integer parse matching `_parseFretInput` semantics so
+        // out-of-range / non-decimal input rejects rather than
+        // partial-parses.
+        const fretM = fretStr.trim().match(/^[-+]?\d+$/);
+        const widthM = widthStr.trim().match(/^[-+]?\d+$/);
+        if (!fretM || !widthM) return;
+        const newFret = Math.max(1, Math.min(24, parseInt(fretM[0], 10)));
+        const newWidth = Math.max(1, Math.min(24, parseInt(widthM[0], 10)));
+        if (newFret === hit.fret && newWidth === hit.width) return;
+        S.history.exec(new EditAnchorFretWidthCmd(
+            menuArrIdx, hit, hit.fret, hit.width, newFret, newWidth,
+        ));
+        draw();
+    };
+    menu.appendChild(editBtn);
+
+    const sep = document.createElement('div');
+    sep.className = 'border-t border-gray-700 my-1';
+    menu.appendChild(sep);
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'w-full text-left px-3 py-1 text-xs hover:bg-dark-500 text-rose-300';
+    delBtn.textContent = 'Delete anchor';
+    delBtn.onclick = () => {
+        hideContextMenu();
+        S.history.exec(new RemoveAnchorCmd(menuArrIdx, hit));
+        S.anchorSel = null;
+        draw();
+    };
+    menu.appendChild(delBtn);
+
+    menu.style.left = e.clientX + 'px';
+    menu.style.top = e.clientY + 'px';
+    menu.classList.remove('hidden');
+    return true;
 }
 
 })();
