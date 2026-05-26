@@ -89,9 +89,15 @@
         </select>
     </div>
 
-    <!-- Canvas area -->
-    <div id="editor-canvas-wrap" class="flex-1 relative overflow-hidden bg-dark-900">
-        <canvas id="editor-canvas" class="absolute inset-0"></canvas>
+    <!-- Canvas area + inspector panel -->
+    <div class="flex-1 flex overflow-hidden">
+        <div id="editor-canvas-wrap" class="flex-1 relative overflow-hidden bg-dark-900">
+            <canvas id="editor-canvas" class="absolute inset-0"></canvas>
+        </div>
+        <!-- Inspector panel — populated by `_renderInspector` whenever the
+             selection changes. Hidden when no notes are selected; the wrapper
+             stays in the DOM so layout is stable across selection changes. -->
+        <div id="editor-inspector" class="hidden w-64 shrink-0 bg-dark-800 border-l border-gray-800 overflow-y-auto text-xs text-gray-200 p-3 space-y-3"></div>
     </div>
 
     <!-- Status bar -->

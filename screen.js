@@ -866,8 +866,8 @@ function hitNoteEdge(mx, my) {
 class EditHistory {
     constructor() { this.undo = []; this.redo = []; }
     exec(cmd) { cmd.exec(); this.undo.push(cmd); this.redo = []; this._afterEdit(); this._ui(); }
-    doUndo() { if (!this.undo.length) return; const c = this.undo.pop(); c.rollback(); this.redo.push(c); this._afterEdit(); this._ui(); draw(); }
-    doRedo() { if (!this.redo.length) return; const c = this.redo.pop(); c.exec(); this.undo.push(c); this._afterEdit(); this._ui(); draw(); }
+    doUndo() { if (!this.undo.length) return; const c = this.undo.pop(); c.rollback(); this.redo.push(c); this._afterEdit(); this._ui(); draw(); updateStatus(); }
+    doRedo() { if (!this.redo.length) return; const c = this.redo.pop(); c.exec(); this.undo.push(c); this._afterEdit(); this._ui(); draw(); updateStatus(); }
     _afterEdit() {
         // Keep the keys viewport in sync with the current note range so
         // multi-octave authoring works without manual range control.
@@ -908,20 +908,58 @@ class MoveNoteCmd {
     }
 }
 
+// Snapshot the selected note refs, then remap `S.sel` back to fresh
+// indices after the caller has mutated `notes()` (typically via a
+// sort that would otherwise leave stale indices pointing at the
+// wrong objects). Inspector bulk edits read through `S.sel`, so any
+// command that sorts/reorders has to keep the index→ref binding
+// consistent.
+function _withStableSelection(mutate) {
+    if (!S.sel || S.sel.size === 0) {
+        mutate();
+        return;
+    }
+    const nn = notes();
+    const selectedRefs = [...S.sel]
+        .map(i => nn[i])
+        .filter(Boolean);
+    mutate();
+    const after = notes();
+    // Build a single ref→index map (O(N)) instead of calling
+    // `Array.indexOf` once per selected ref (O(selected × N)). Matters
+    // on long arrangements / large multi-selects.
+    const refToIdx = new Map();
+    for (let i = 0; i < after.length; i++) refToIdx.set(after[i], i);
+    S.sel.clear();
+    for (const ref of selectedRefs) {
+        const i = refToIdx.get(ref);
+        if (i !== undefined) S.sel.add(i);
+    }
+}
+
 class AddNoteCmd {
     constructor(note) { this.note = note; this.idx = -1; }
     exec() {
         const nn = notes();
         nn.push(this.note);
-        this.idx = nn.length - 1;
-        nn.sort((a, b) => a.time - b.time);
-        // Find new index
+        // Sorting the notes array can shift the indices stored in
+        // `S.sel` so they end up pointing at different note objects.
+        // Re-bind the selection through the ref→index round-trip.
+        _withStableSelection(() => {
+            nn.sort((a, b) => a.time - b.time);
+        });
         this.idx = nn.indexOf(this.note);
     }
     rollback() {
         const nn = notes();
-        const i = nn.indexOf(this.note);
-        if (i >= 0) nn.splice(i, 1);
+        // Removing via splice shifts every index past `i` down by one,
+        // so the selection would silently re-bind to wrong notes after
+        // undo. Wrap the removal so `S.sel` stays bound to refs across
+        // the index shift.
+        _withStableSelection(() => {
+            const i = nn.indexOf(this.note);
+            if (i >= 0) nn.splice(i, 1);
+        });
     }
 }
 
@@ -1559,6 +1597,11 @@ function onContextMenu(e) {
     if (!S.sel.has(idx)) {
         S.sel.clear();
         S.sel.add(idx);
+        // Selection changed — refresh the status bar's selection count
+        // and the inspector's bulk-edit state so both reflect the
+        // just-right-clicked note instead of the previous selection.
+        // updateStatus() already calls _renderInspector internally.
+        updateStatus();
     }
     draw();
     showContextMenu(e.clientX, e.clientY, idx);
@@ -1754,12 +1797,27 @@ function onKeyDown(e) {
                 sustain: n.sustain,
                 techniques: { ...(n.techniques || {}) },
             }));
-            // Batch add via a compound command
+            // Batch add via a compound command. Wrap both exec (sort
+            // can reshuffle) and rollback (splice shifts indices) in
+            // `_withStableSelection` so undo/redo can't leave `S.sel`
+            // pointing at unrelated notes.
             const nn = notes();
             const addCmd = {
                 _notes: newNotes,
-                exec() { for (const n of this._notes) nn.push(n); nn.sort((a, b) => a.time - b.time); },
-                rollback() { for (const n of this._notes) { const i = nn.indexOf(n); if (i >= 0) nn.splice(i, 1); } },
+                exec() {
+                    _withStableSelection(() => {
+                        for (const n of this._notes) nn.push(n);
+                        nn.sort((a, b) => a.time - b.time);
+                    });
+                },
+                rollback() {
+                    _withStableSelection(() => {
+                        for (const n of this._notes) {
+                            const i = nn.indexOf(n);
+                            if (i >= 0) nn.splice(i, 1);
+                        }
+                    });
+                },
             };
             S.history.exec(addCmd);
             // Select pasted notes
@@ -1847,6 +1905,7 @@ function promptFret(idx) {
     const fret = Math.max(0, Math.min(24, parsed < 0 ? 0 : parsed));
     S.history.exec(new ChangeFretCmd(idx, fret));
     draw();
+    _renderInspector();
 }
 
 function promptBend(idx) {
@@ -1856,10 +1915,18 @@ function promptBend(idx) {
     const current = techs.bend || 0;
     const val = prompt('Bend amount in semitones (0 = none, 1 = full, 0.5 = half):', current);
     if (val === null) return;
-    const bend = Math.max(0, Math.min(3, parseFloat(val) || 0));
+    // Strict-numeric parse — `Number('1abc')` is NaN, while
+    // `parseFloat('1abc')` would partial-parse to `1`. Matches the
+    // inspector's `_coerceInspectorNumber` for the same field so both
+    // entry points accept/reject the same set of inputs.
+    const s = String(val).trim();
+    const parsed = s === '' ? NaN : Number(s);
+    if (!Number.isFinite(parsed)) return;
+    const bend = Math.max(0, Math.min(3, parsed));
     if (!n.techniques) n.techniques = {};
     n.techniques.bend = bend;
     draw();
+    _renderInspector();
 }
 
 // Parse a `prompt()` fret input strictly: a plain decimal integer
@@ -1887,6 +1954,7 @@ function promptSlide(idx) {
     const fret = _parseFretInput(val);
     n.techniques.slide_to = fret < 0 ? -1 : Math.min(24, fret);
     draw();
+    _renderInspector();
 }
 
 function promptSlideUnpitch(idx) {
@@ -1900,6 +1968,7 @@ function promptSlideUnpitch(idx) {
     const fret = _parseFretInput(val);
     n.techniques.slide_unpitch_to = fret < 0 ? -1 : Math.min(24, fret);
     draw();
+    _renderInspector();
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -2577,8 +2646,276 @@ function updateStatus() {
     const cc = chords();
     document.getElementById('editor-note-count').textContent =
         `${nn.length} notes, ${cc.length} chords` + (S.sel.size ? ` | ${S.sel.size} selected` : '');
+    _renderInspector();
     setStatus('Ready');
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Inspector panel — right-side note attribute editor (PR3b of the
+// tones+notation UI follow-up). Reflects S.sel; mutations apply to
+// every selected note so multi-select bulk edits work without a new
+// command class.
+// ════════════════════════════════════════════════════════════════════
+
+// All boolean technique flags the inspector exposes. The label is what
+// the UI shows; the key matches the `techniques` dict on a note.
+const _INSPECTOR_FLAGS = [
+    { key: 'hammer_on',      label: 'Hammer-On' },
+    { key: 'pull_off',       label: 'Pull-Off' },
+    { key: 'palm_mute',      label: 'Palm Mute' },
+    { key: 'fret_hand_mute', label: 'Fret-Hand Mute' },
+    { key: 'mute',           label: 'String Mute' },
+    { key: 'harmonic',       label: 'Harmonic' },
+    { key: 'harmonic_pinch', label: 'Pinch Harmonic' },
+    { key: 'accent',         label: 'Accent' },
+    { key: 'vibrato',        label: 'Vibrato' },
+    { key: 'tremolo',        label: 'Tremolo' },
+    { key: 'tap',            label: 'Tap' },
+    { key: 'slap',           label: 'Slap' },
+    { key: 'pluck',          label: 'Pop (Pluck)' },
+    { key: 'link_next',      label: 'Link Next' },
+    { key: 'ignore',         label: 'Ignore' },
+];
+
+function _selectedNotes() {
+    if (!S.sel || S.sel.size === 0) return [];
+    const nn = notes();
+    return [...S.sel].map(i => nn[i]).filter(Boolean);
+}
+
+// Reduce a getter across the selection: returns the shared value, or
+// `null` when the selection is mixed. Used to render either a concrete
+// value or the "(mixed)" placeholder.
+function _selSharedValue(sel, getter, eq) {
+    eq = eq || ((a, b) => a === b);
+    if (sel.length === 0) return null;
+    const first = getter(sel[0]);
+    for (let i = 1; i < sel.length; i++) {
+        if (!eq(getter(sel[i]), first)) return null;
+    }
+    return first;
+}
+
+function _renderInspector() {
+    const el = document.getElementById('editor-inspector');
+    if (!el) return;
+    const sel = _selectedNotes();
+    const wasVisible = !el.classList.contains('hidden');
+    if (sel.length === 0) {
+        if (wasVisible) {
+            el.classList.add('hidden');
+            el.innerHTML = '';
+            // Hiding the panel grows the canvas wrap back to full
+            // width — without a resize the canvas backing buffer keeps
+            // the old narrower width and we render into a stale region.
+            _scheduleCanvasResize();
+        }
+        return;
+    }
+    if (!wasVisible) {
+        el.classList.remove('hidden');
+        // Showing the panel shrinks the canvas wrap; refresh the canvas
+        // backing dimensions so notes stay inside the visible region
+        // instead of being clipped past the panel's left edge.
+        _scheduleCanvasResize();
+    }
+
+    // Header: condensed summary of the selection.
+    const sharedString = _selSharedValue(sel, n => n.string);
+    const sharedFret = _selSharedValue(sel, n => n.fret);
+    const sharedTime = _selSharedValue(sel, n => n.time);
+    const sharedSustain = _selSharedValue(sel, n => n.sustain || 0);
+    const headerCount = sel.length === 1
+        ? '1 note selected'
+        : `${sel.length} notes selected`;
+    const mixed = '<span class="text-amber-400">(mixed)</span>';
+    const fmtStr = v => v === null ? mixed : v;
+    const fmtTime = v => v === null ? mixed : v.toFixed(3);
+    const fmtSus = v => v === null ? mixed : (v || 0).toFixed(3);
+
+    // Numeric inputs — when the selection has a shared value, prefill
+    // it; when mixed, leave blank and let the user supply a new value
+    // that applies to all.
+    const sharedBend = _selSharedValue(sel, n => (n.techniques && n.techniques.bend) || 0);
+    const sharedSlide = _selSharedValue(sel, n => {
+        const v = n.techniques && n.techniques.slide_to;
+        return v === undefined ? -1 : v;
+    });
+    const sharedSlideU = _selSharedValue(sel, n => {
+        const v = n.techniques && n.techniques.slide_unpitch_to;
+        return v === undefined ? -1 : v;
+    });
+    const inputVal = v => v === null ? '' : String(v);
+
+    let html = `
+        <div class="space-y-1">
+            <div class="font-semibold text-gray-100">${headerCount}</div>
+            <div class="text-gray-400">string: ${fmtStr(sharedString)}</div>
+            <div class="text-gray-400">fret: ${fmtStr(sharedFret)}</div>
+            <div class="text-gray-400">time: ${fmtTime(sharedTime)}</div>
+            <div class="text-gray-400">sustain: ${fmtSus(sharedSustain)}</div>
+        </div>
+        <div class="space-y-2 border-t border-gray-700 pt-3">
+            <label class="flex items-center gap-2">
+                <span class="w-24 text-gray-400">Sustain</span>
+                <input type="number" min="0" step="0.05" value="${inputVal(sharedSustain)}"
+                    placeholder="${sharedSustain === null ? 'mixed' : ''}"
+                    onchange="editorInspectorSetField('sustain', this.value)"
+                    class="flex-1 bg-dark-700 border border-gray-700 rounded px-1 py-0.5 text-xs">
+            </label>
+            <label class="flex items-center gap-2">
+                <span class="w-24 text-gray-400">Bend (semi)</span>
+                <input type="number" min="0" max="3" step="0.5" value="${inputVal(sharedBend)}"
+                    placeholder="${sharedBend === null ? 'mixed' : ''}"
+                    onchange="editorInspectorSetTech('bend', this.value)"
+                    class="flex-1 bg-dark-700 border border-gray-700 rounded px-1 py-0.5 text-xs">
+            </label>
+            <label class="flex items-center gap-2">
+                <span class="w-24 text-gray-400">Slide to</span>
+                <input type="number" min="-1" max="24" step="1" value="${inputVal(sharedSlide)}"
+                    placeholder="${sharedSlide === null ? 'mixed' : ''}"
+                    onchange="editorInspectorSetTech('slide_to', this.value)"
+                    class="flex-1 bg-dark-700 border border-gray-700 rounded px-1 py-0.5 text-xs">
+            </label>
+            <label class="flex items-center gap-2">
+                <span class="w-24 text-gray-400">Slide unp.</span>
+                <input type="number" min="-1" max="24" step="1" value="${inputVal(sharedSlideU)}"
+                    placeholder="${sharedSlideU === null ? 'mixed' : ''}"
+                    onchange="editorInspectorSetTech('slide_unpitch_to', this.value)"
+                    class="flex-1 bg-dark-700 border border-gray-700 rounded px-1 py-0.5 text-xs">
+            </label>
+        </div>
+        <div class="space-y-1 border-t border-gray-700 pt-3">`;
+
+    for (const f of _INSPECTOR_FLAGS) {
+        const sharedFlag = _selSharedValue(sel, n => !!(n.techniques && n.techniques[f.key]));
+        // Three states: true / false / null (mixed). HTML's `indeterminate`
+        // is only set via property, not attribute — handle it after
+        // injecting via the post-mount pass below.
+        const checked = sharedFlag === true;
+        const indeterminate = sharedFlag === null;
+        html += `
+            <label class="flex items-center gap-2">
+                <input type="checkbox" data-flag="${f.key}" ${checked ? 'checked' : ''}
+                    ${indeterminate ? 'data-indeterminate="1"' : ''}
+                    onchange="editorInspectorSetFlag('${f.key}', this.checked)"
+                    class="rounded border-gray-600 bg-dark-700">
+                <span>${f.label}</span>
+            </label>`;
+    }
+    html += `</div>`;
+    el.innerHTML = html;
+
+    // Apply indeterminate state to the inputs that need it — the
+    // attribute alone doesn't work; the JS property does.
+    for (const cb of el.querySelectorAll('input[type=checkbox][data-indeterminate="1"]')) {
+        cb.indeterminate = true;
+    }
+}
+
+// Inspector mutators. All operate on the full S.sel so a multi-select
+// edit applies bulk-style. Edits skip the undo history for now — PR3b
+// keeps the scope tight; a TechBulkCmd lands when the inspector grows
+// to need richer per-edit undo (PR3c handles tone/anchor lanes, where
+// undo IS load-bearing).
+
+// Bounds for the inspector's numeric inputs. Mirrors the limits the
+// prompt-based editors (`promptFret`, `promptSlide`, `promptBend`)
+// enforce — `type="number" min/max` on the inputs is only a UI hint;
+// users can paste / type out-of-range values, so we clamp here too.
+const _INSPECTOR_BOUNDS = {
+    // Sustain has no hard upper bound elsewhere (drag-resize / add-note
+    // dialog leave it unconstrained), so the inspector matches — only
+    // the lower clamp matters for input sanity.
+    sustain: { min: 0, max: Infinity, integer: false },
+    bend:    { min: 0, max: 3,  integer: false }, // half-steps, 3 = +3 semitones
+    // `emptyAs: -1` matches the prompt semantic ("-1 or empty = no
+    // slide") so the inspector and `promptSlide` / `promptSlideUnpitch`
+    // accept the same set of inputs. Without it, deleting the input
+    // value would be treated as a parse error and silently bounce back.
+    slide_to:         { min: -1, max: 24, integer: true, emptyAs: -1 },
+    slide_unpitch_to: { min: -1, max: 24, integer: true, emptyAs: -1 },
+};
+
+function _coerceInspectorNumber(rawValue, bounds) {
+    if (rawValue === null || rawValue === undefined) return null;
+    const s = String(rawValue).trim();
+    if (s === '') {
+        // Some fields (slide_to, slide_unpitch_to) interpret an empty
+        // input as a "clear" affordance — match the prompt-based path.
+        return bounds.emptyAs !== undefined ? bounds.emptyAs : null;
+    }
+    let v;
+    if (bounds.integer) {
+        // Strict plain-decimal integer regex — matches the
+        // prompt-based path's `_parseFretInput`. Rejects `1e1`, `1.9`,
+        // `12abc` so the inspector and the right-click prompt produce
+        // the same accept/reject decision on identical input.
+        if (!/^[-+]?\d+$/.test(s)) return null;
+        v = Number(s);
+    } else {
+        // `Number('1e1abc')` is NaN; `parseFloat('1e1abc')` would
+        // partial-parse to 10. Use `Number(...)` so junk-tail input
+        // rejects instead of coercing.
+        v = Number(s);
+    }
+    if (!Number.isFinite(v)) return null;
+    if (v < bounds.min) v = bounds.min;
+    if (v > bounds.max) v = bounds.max;
+    return v;
+}
+
+window.editorInspectorSetField = (field, raw) => {
+    const sel = _selectedNotes();
+    if (sel.length === 0) return;
+    const bounds = _INSPECTOR_BOUNDS[field];
+    if (!bounds) return;
+    const v = _coerceInspectorNumber(raw, bounds);
+    if (v === null) {
+        // Reject silently — but re-render so the input snaps back to
+        // the current shared value instead of leaving the user looking
+        // at an unapplied edit.
+        _renderInspector();
+        return;
+    }
+    if (field === 'sustain') {
+        for (const n of sel) n.sustain = v;
+    }
+    draw();
+    updateStatus();
+};
+
+window.editorInspectorSetTech = (key, raw) => {
+    const sel = _selectedNotes();
+    if (sel.length === 0) return;
+    const bounds = _INSPECTOR_BOUNDS[key];
+    if (!bounds) return;
+    const v = _coerceInspectorNumber(raw, bounds);
+    if (v === null) {
+        // Same as `editorInspectorSetField` — bounce the input back
+        // to the current shared value on rejection so the panel can't
+        // drift visually from the underlying model.
+        _renderInspector();
+        return;
+    }
+    for (const n of sel) {
+        if (!n.techniques) n.techniques = {};
+        n.techniques[key] = v;
+    }
+    draw();
+    updateStatus();
+};
+
+window.editorInspectorSetFlag = (key, on) => {
+    const sel = _selectedNotes();
+    if (sel.length === 0) return;
+    for (const n of sel) {
+        if (!n.techniques) n.techniques = {};
+        n.techniques[key] = !!on;
+    }
+    draw();
+    updateStatus();
+};
 
 function updateZoomDisplay() {
     const el = document.getElementById('editor-zoom-display');
@@ -2588,6 +2925,19 @@ function updateZoomDisplay() {
 function updateBPMDisplay() {
     const el = document.getElementById('editor-bpm');
     if (el && S.beats.length >= 2) el.value = getTabBPM().toFixed(1);
+}
+
+// Defer a `resizeCanvas` until layout has settled — used when a
+// sibling panel (inspector) just toggled visibility. Without the
+// rAF the panel's `display:none → flex` transition hasn't applied
+// when `clientWidth` is read, so the canvas would resize to the
+// pre-toggle width.
+function _scheduleCanvasResize() {
+    // `resizeCanvas` already calls `draw()` once it has the new
+    // dimensions; no extra render needed here.
+    requestAnimationFrame(() => {
+        resizeCanvas();
+    });
 }
 
 function resizeCanvas() {
@@ -2716,6 +3066,10 @@ window.editorToggleTech = (idx, tech) => {
     n.techniques[tech] = !n.techniques[tech];
     hideContextMenu();
     draw();
+    // Refresh the inspector — when the right-click toggle fires on a
+    // selected note, the panel's checkbox state needs to follow the
+    // mutation or it stays stale until the next selection change.
+    _renderInspector();
 };
 
 // Allow loading from other plugins/screens
