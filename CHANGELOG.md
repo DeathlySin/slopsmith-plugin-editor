@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Sloppak save** now repopulates each phrase's per-difficulty
+  `levels[].notes/chords/anchors` from the editor's flat lists.
+  Previously `_save_sloppak` round-tripped phrases verbatim from the
+  source PSARC, so the highway's mastery-filter consumer
+  (`static/highway.js`, which reads notes from
+  `phrases[].levels[idx].notes` whenever phrases are present)
+  silently rendered the original PSARC chart — every added, edited,
+  or deleted note was invisible on 2D/3D highways. Only arrangements
+  with no source-side phrases (e.g. user-added bass on a sloppak that
+  lacked one) were unaffected, because the highway falls back to the
+  flat `notes` array when `phrases` is absent. This makes the mastery
+  slider a no-op for editor-saved sloppaks (every level shows the
+  same notes), which matches the editor's single-difficulty authoring
+  model. Phrase windows are derived from each phrase's `start_time`
+  and the next phrase's `start_time` (with the first/last extending
+  to ±∞), not from the stored `end_time` — the tempo-edit path
+  updates note times and phrase `start_time` but does not touch
+  `end_time`, so trusting `end_time` would mis-bucket notes after a
+  tempo remap. Notes outside any phrase's window (gaps in the source
+  PSARC's coverage, or user additions before/after the original
+  phrase range) land in the nearest first/last phrase.
+
 ## [1.4.2] - 2026-05-26
 
 ### Fixed

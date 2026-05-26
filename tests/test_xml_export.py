@@ -8,6 +8,7 @@ Covers:
 * manual anchors via `anchors_user` overriding `_compute_anchors`
 * default behavior unchanged when no new fields are supplied
 """
+import copy
 from xml.etree import ElementTree as ET
 
 from routes import (
@@ -678,3 +679,130 @@ def test_arr_dict_to_wire_handshapes_and_anchors_user():
     assert wire["handshapes"][0]["chord_id"] == 0
     assert wire["handshapes"][0]["arp"] is True
     assert wire["anchors"][0]["fret"] == 5
+
+
+# ---- phrase level repopulation --------------------------------------------
+#
+# Regression for the "highway shows original chart instead of edits" bug:
+# `_save_sloppak` used to round-trip phrase levels verbatim from the source
+# PSARC, so `static/highway.js`'s mastery filter (which reads notes from
+# `phrases[].levels[idx].notes`, never from the flat `notes` array, when
+# phrases are present) silently rendered the original chart.
+
+from routes import _repopulate_phrase_levels
+
+
+def _phrase(start, end, n_levels=1, *, notes=None, max_diff=None):
+    levels = [
+        {"difficulty": i,
+         "notes": list(notes) if notes is not None else [{"t": -999}],
+         "chords": [{"t": -999}],
+         "anchors": [{"time": -999}],
+         "handshapes": [{"chord_id": i}]}
+        for i in range(n_levels)
+    ]
+    return {
+        "start_time": start,
+        "end_time": end,
+        "max_difficulty": (n_levels - 1) if max_diff is None else max_diff,
+        "levels": levels,
+    }
+
+
+def test_repopulate_phrase_levels_slices_by_time_window():
+    phrases = [_phrase(0.0, 5.0), _phrase(5.0, 10.0)]
+    notes = [
+        {"t": 1.0, "s": 0, "f": 3},
+        {"t": 4.999, "s": 1, "f": 5},
+        {"t": 5.0, "s": 2, "f": 7},     # boundary belongs to next phrase
+        {"t": 9.0, "s": 3, "f": 9},
+    ]
+    out = _repopulate_phrase_levels(phrases, notes, [], [])
+    assert [n["t"] for n in out[0]["levels"][0]["notes"]] == [1.0, 4.999]
+    # Last phrase: end extends to +inf, so the 9.0 note lands in it.
+    assert [n["t"] for n in out[1]["levels"][0]["notes"]] == [5.0, 9.0]
+
+
+def test_repopulate_phrase_levels_first_phrase_catches_pre_start_notes():
+    """Notes before the first phrase's start_time still need to surface
+    on the highway — they fall into the first phrase's level (which
+    extends back to -inf)."""
+    phrases = [_phrase(10.0, 20.0), _phrase(20.0, 30.0)]
+    notes = [{"t": 0.5, "s": 0, "f": 3}, {"t": 25.0, "s": 1, "f": 5}]
+    out = _repopulate_phrase_levels(phrases, notes, [], [])
+    assert out[0]["levels"][0]["notes"] == [{"t": 0.5, "s": 0, "f": 3}]
+    assert out[1]["levels"][0]["notes"] == [{"t": 25.0, "s": 1, "f": 5}]
+
+
+def test_repopulate_phrase_levels_ignores_stale_end_time():
+    """Boundaries come from the *next* phrase's start_time, not from
+    `end_time`. The editor's tempo remap touches phrase start times but
+    not end times, so a stale `end_time` must not mis-bucket a note.
+
+    Setup: phrase[0] has end_time=2.0 (stale, predating a tempo edit
+    that pushed phrase[1].start_time out to 8.0). A note at t=5.0
+    falls in the gap relative to end_time but inside the live
+    [phrase[0].start, phrase[1].start) window. The slicer must land
+    it in phrase[0]."""
+    phrases = [_phrase(0.0, 2.0), _phrase(8.0, 10.0)]
+    notes = [{"t": 5.0, "s": 0, "f": 3}]
+    out = _repopulate_phrase_levels(phrases, notes, [], [])
+    assert out[0]["levels"][0]["notes"] == [{"t": 5.0, "s": 0, "f": 3}]
+    assert out[1]["levels"][0]["notes"] == []
+
+
+def test_repopulate_phrase_levels_overwrites_stale_levels():
+    """Each level's old `notes` (representing the source PSARC) must be
+    replaced — not merged — by the fresh slice. Otherwise stale notes
+    would still surface in the mastery filter."""
+    phrases = [_phrase(0.0, 5.0, n_levels=3)]
+    notes = [{"t": 2.0, "s": 0, "f": 3}]
+    out = _repopulate_phrase_levels(phrases, notes, [], [])
+    for lv in out[0]["levels"]:
+        assert lv["notes"] == notes
+        # Sentinel -999 from the input must be gone.
+        assert all(n["t"] != -999 for n in lv["notes"])
+
+
+def test_repopulate_phrase_levels_last_phrase_catches_past_end_notes():
+    """User additions past the original last-phrase boundary should not
+    disappear from the chart."""
+    phrases = [_phrase(0.0, 5.0), _phrase(5.0, 10.0)]
+    notes = [{"t": 99.0, "s": 0, "f": 3}]
+    out = _repopulate_phrase_levels(phrases, notes, [], [])
+    assert out[0]["levels"][0]["notes"] == []
+    assert out[1]["levels"][0]["notes"] == [{"t": 99.0, "s": 0, "f": 3}]
+
+
+def test_repopulate_phrase_levels_preserves_handshapes_and_metadata():
+    """Handshapes aren't editor-authored — they must round-trip verbatim,
+    along with phrase metadata (start/end/max_difficulty) and level
+    `difficulty`."""
+    phrases = [_phrase(0.0, 5.0, n_levels=2, max_diff=7)]
+    out = _repopulate_phrase_levels(phrases, [], [], [])
+    p = out[0]
+    assert p["start_time"] == 0.0
+    assert p["end_time"] == 5.0
+    assert p["max_difficulty"] == 7
+    assert [lv["difficulty"] for lv in p["levels"]] == [0, 1]
+    assert [lv["handshapes"] for lv in p["levels"]] == [
+        [{"chord_id": 0}], [{"chord_id": 1}],
+    ]
+
+
+def test_repopulate_phrase_levels_does_not_mutate_input():
+    phrases = [_phrase(0.0, 5.0)]
+    snapshot = copy.deepcopy(phrases)
+    _repopulate_phrase_levels(phrases, [{"t": 1.0}], [], [])
+    assert phrases == snapshot
+
+
+def test_repopulate_phrase_levels_handles_chords_and_anchors():
+    phrases = [_phrase(0.0, 10.0)]
+    chords = [{"t": 1.0, "id": 0}, {"t": 9.0, "id": 1}]
+    anchors = [{"time": 0.0, "fret": 5, "width": 4},
+               {"time": 8.0, "fret": 7, "width": 4}]
+    out = _repopulate_phrase_levels(phrases, [], chords, anchors)
+    lv = out[0]["levels"][0]
+    assert lv["chords"] == chords
+    assert lv["anchors"] == anchors

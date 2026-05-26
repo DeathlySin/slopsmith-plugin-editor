@@ -433,6 +433,62 @@ def _arr_dict_to_wire(
     return wire
 
 
+def _repopulate_phrase_levels(phrases, notes, chords, anchors):
+    """Re-slice each phrase level's notes/chords/anchors from the flat
+    editor lists.
+
+    The editor authors a single flat note/chord/anchor list per
+    arrangement; the multi-level `phrases[].levels[]` structure comes
+    from the source PSARC and the editor UI does not re-author it. If
+    we round-trip those levels verbatim on save, the highway's
+    mastery-filter consumer (`static/highway.js`) reads stale per-level
+    notes and silently renders the original chart — additions, edits,
+    and deletions all vanish.
+
+    Repopulating every level with the same flat-list slice for the
+    phrase's time window makes the mastery slider a no-op (each
+    level renders the same notes) but keeps the rest of the chart
+    correct. Handshapes round-trip verbatim — the editor doesn't
+    expose them and they're tied to chord templates that don't shift
+    on per-note edits.
+
+    Phrase boundaries are derived from each phrase's `start_time`
+    and the *next* phrase's `start_time` (with the first phrase's
+    window extending back to -inf and the last forward to +inf).
+    Trusting the stored `end_time` instead would mis-bucket notes
+    after a tempo remap — the editor's tempo-edit path updates note
+    times and phrase `start_time` but does not touch `end_time`, so
+    `end_time` can drift out of sync with both the notes and the
+    next phrase's start. Anchors and notes outside any phrase's
+    window (gaps in the source PSARC's phrase coverage, or user
+    additions past the song's original phrase data) still need to
+    surface on the highway, so the first/last phrases swallow the
+    -inf / +inf tails.
+    """
+    out = []
+    n_phrases = len(phrases)
+    starts = [_safe_float(p.get("start_time"), 0.0) for p in phrases]
+    for i, p in enumerate(phrases):
+        # First phrase extends back to -inf, last forward to +inf —
+        # see docstring on gap/tail handling.
+        t0 = float("-inf") if i == 0 else starts[i]
+        t1 = float("inf") if i == n_phrases - 1 else starts[i + 1]
+        pn = [x for x in notes if t0 <= _safe_float(x.get("t"), 0.0) < t1]
+        pc = [x for x in chords if t0 <= _safe_float(x.get("t"), 0.0) < t1]
+        pa = [x for x in anchors if t0 <= _safe_float(x.get("time"), 0.0) < t1]
+        new_levels = []
+        for lv in p.get("levels", []):
+            new_lv = dict(lv)
+            new_lv["notes"] = list(pn)
+            new_lv["chords"] = list(pc)
+            new_lv["anchors"] = list(pa)
+            new_levels.append(new_lv)
+        new_p = dict(p)
+        new_p["levels"] = new_levels
+        out.append(new_p)
+    return out
+
+
 def _note_attrs_xml(n, *, include_time=True):
     """Build the attribute dict for a single <note>/<chordNote>.
 
@@ -1674,7 +1730,9 @@ def setup(app, context):
                 )
                 ph = arr_dict.get("phrases")
                 if ph:
-                    wire["phrases"] = list(ph)
+                    wire["phrases"] = _repopulate_phrase_levels(
+                        ph, wire["notes"], wire["chords"], wire["anchors"],
+                    )
                 if is_first:
                     wire["beats"] = [
                         {"time": round(float(b.get("time", 0)), 3),
