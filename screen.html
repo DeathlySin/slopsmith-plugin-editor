@@ -28,6 +28,7 @@
         <button id="editor-add-keys-btn" onclick="editorShowAddKeysModal()" class="px-3 py-1 bg-indigo-900 hover:bg-indigo-800 rounded text-xs font-medium hidden">+ Keys</button>
         <button id="editor-strings-btn" onclick="editorShowStringsModal()" class="px-3 py-1 bg-amber-800 hover:bg-amber-700 rounded text-xs font-medium hidden" title="Add or remove strings on the active arrangement (extended-range guitar / bass)">⋮ Strings</button>
         <button id="editor-record-midi-btn" onclick="editorShowRecordMidiModal()" class="px-3 py-1 bg-rose-900 hover:bg-rose-800 rounded text-xs font-medium hidden disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-rose-900" title="Record a Keys arrangement live from a MIDI keyboard (Chrome/Edge)">● Record</button>
+        <button id="editor-tones-btn" onclick="editorShowTonesModal()" class="px-3 py-1 bg-cyan-900 hover:bg-cyan-800 rounded text-xs font-medium hidden" title="Tone slot names and base tone for this arrangement">♪ Tones…</button>
 
         <div class="h-4 w-px bg-gray-700"></div>
 
@@ -407,6 +408,37 @@
                     Save as PSARC (lose extra strings)
                 </button>
                 <button onclick="editorHideSaveFormatModal()"
+                    class="w-full px-3 py-2 text-gray-500 hover:text-white rounded text-xs">
+                    Cancel
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Tone slots modal — names the five tone slots (base + A/B/C/D) and
+     picks which one is the base. Tone changes placed on the lane store
+     their slot name verbatim, so the slot list here is mostly a UI
+     dictionary that the lane uses for click-to-place + display. -->
+<div id="editor-tones-modal" class="hidden absolute inset-0 z-50 flex items-center justify-center" style="background:rgba(0,0,0,0.7)">
+    <div class="bg-dark-700 rounded-xl border border-gray-700 w-full max-w-md flex flex-col">
+        <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+            <span class="text-sm font-medium">Tone slots</span>
+            <button onclick="editorHideTonesModal()" class="text-gray-500 hover:text-white">&times;</button>
+        </div>
+        <div class="p-4 space-y-3 text-xs text-gray-300">
+            <p class="text-gray-400">
+                Name the five tone slots and pick which one is the base
+                tone. The base plays from the start of the song; the
+                others can be placed on the tone lane to switch into.
+            </p>
+            <div id="editor-tones-slots" class="space-y-2"></div>
+            <div class="flex flex-col gap-2 pt-2">
+                <button onclick="editorApplyTonesModal()"
+                    class="w-full px-3 py-2 bg-cyan-800 hover:bg-cyan-700 rounded text-xs font-medium">
+                    Apply
+                </button>
+                <button onclick="editorHideTonesModal()"
                     class="w-full px-3 py-2 text-gray-500 hover:text-white rounded text-xs">
                     Cancel
                 </button>

@@ -67,6 +67,15 @@ const KEYS_PATTERN = /^(keys|piano|keyboard|synth)/i;
 // State
 // ════════════════════════════════════════════════════════════════════
 
+// ─── Tone-lane constants (PR3c) ────────────────────────────────────
+// Hoisted to module scope so the values are initialised before any
+// callsite — `draw()` calls `drawToneLane()` which reads them, and
+// async callbacks could in theory fire before the bottom of the
+// IIFE if any of them got scheduled during init().
+const TONE_LANE_H = 16;
+const _TONE_SLOT_DEFAULTS = ['Clean', 'Drive', 'Lead', 'Crunch', 'Effect'];
+const _TONE_SLOT_COLORS = ['#7dd3fc', '#f87171', '#fbbf24', '#a78bfa', '#34d399'];
+
 const S = {
     // Song data
     title: '', artist: '', sessionId: null, filename: '',
@@ -74,6 +83,12 @@ const S = {
     arrangements: [],
     currentArr: 0,
     beats: [], sections: [], duration: 0, offset: 0,
+    // Selected tone-change marker — stored as a direct ref into the
+    // active arrangement's `arr.tones.changes` array (not an index)
+    // so commands that sort/splice that array don't invalidate the
+    // selection. `null` means no marker is selected — Del key falls
+    // through to the note delete path.
+    toneSel: null,
 
     // Drum tab — null until the user adds drums via the +Drums modal, then
     // a dict matching docs/sloppak-spec.md §5.3 ({version,name,kit,hits}).
@@ -477,6 +492,7 @@ function draw() {
     _laneLabelsCacheValue = laneLabels();
     try {
         drawWaveform(w);
+        drawToneLane(w);
         drawLanes(w);
         drawGrid(w);
         drawSections(w);
@@ -1261,6 +1277,21 @@ function onMouseDown(e) {
         return;
     }
 
+    // Tone lane sits in the top TONE_LANE_H px (an overlay on the
+    // waveform's top edge). Hijack the click before the waveform-seek
+    // handler so add/move/select-marker interactions work.
+    if (y >= 0 && y < TONE_LANE_H && S.arrangements && S.arrangements.length) {
+        if (onToneLaneMouseDown(e, x)) return;
+    }
+    // Click outside the tone lane → clear the tone selection so the
+    // next Del press targets the note path instead of the previously
+    // selected tone marker.
+    if (S.toneSel !== null) {
+        S.toneSel = null;
+        // No explicit `draw()` here — the surrounding mouse-down path
+        // already triggers one for the new interaction.
+    }
+
     // Left button
     if (y < WAVEFORM_H) {
         // Block waveform seek while recording: restarting the AudioBufferSourceNode
@@ -1362,6 +1393,13 @@ function onMouseMove(e) {
 }
 
 function _onMouseMoveBody(e, x, y, L) {
+
+    // Tone-marker drag — hijack before any of the existing
+    // drag-handler branches so the marker tracks the cursor.
+    if (S.drag && S.drag.type === 'tone') {
+        onToneLaneMouseMove(e, x);
+        return;
+    }
 
     // Cursor hint when not dragging
     if (!S.drag) {
@@ -1476,6 +1514,11 @@ function onMouseUp(e) {
         return;
     }
 
+    if (S.drag.type === 'tone') {
+        onToneLaneMouseUp();
+        return;
+    }
+
     if (S.drag.type === 'resize') {
         const nn = notes();
         const finalSustain = nn[S.drag.noteIdx].sustain;
@@ -1581,6 +1624,13 @@ function onContextMenu(e) {
     if (S.tempoMapMode) { e.preventDefault(); _tempoMapOnContextMenu(e); return; }
     e.preventDefault();
     const { x, y } = getMousePos(e);
+
+    // Tone-lane right-click — slot picker for the hit marker (and a
+    // delete entry). Falls through to the existing menu logic when
+    // there's no marker under the cursor.
+    if (y >= 0 && y < TONE_LANE_H && S.arrangements && S.arrangements.length) {
+        if (onToneLaneContextMenu(e, x)) return;
+    }
 
     // Right-click on beat bar or lanes with no note = section menu
     const beatBarY = isKeysMode()
@@ -1692,6 +1742,24 @@ function onKeyDown(e) {
             e.preventDefault();
             _tempoDeleteSyncPoint(S.tempoSel);
             return;
+        }
+        // Tone-lane: delete the selected tone-change marker. Same
+        // input-focus guard as the note-delete path below. Skip when
+        // drum-edit or tempo-map mode is active — those modes own
+        // Delete for their own selections, and `S.toneSel` isn't
+        // cleared when entering them, so an old tone selection could
+        // otherwise hijack the keypress.
+        if (S.toneSel && !S.drumEditMode && !S.tempoMapMode &&
+                !e.target.matches('input, select, textarea')) {
+            const arr = _currentToneArr();
+            if (arr && arr.tones && Array.isArray(arr.tones.changes)
+                    && arr.tones.changes.includes(S.toneSel)) {
+                e.preventDefault();
+                S.history.exec(new RemoveToneChangeCmd(S.currentArr, S.toneSel));
+                S.toneSel = null;
+                draw();
+                return;
+            }
         }
         // Drum-edit mode: delete selected drum hits in place. No undo
         // (would need a sibling DrumEditCmd class — out of scope for this PR).
@@ -2213,6 +2281,7 @@ async function loadCDLC(filename) {
         S.drag = null;
         S.currentArr = 0;
         S.sel.clear();
+        S.toneSel = null;
         S.scrollX = 0;
         S.cursorTime = 0;
         S.history = new EditHistory();
@@ -2235,6 +2304,7 @@ async function loadCDLC(filename) {
         document.getElementById('editor-play-btn').disabled = !data.audio_url;
         document.getElementById('editor-sync-btn').classList.toggle('hidden', !data.audio_url);
         document.getElementById('editor-replace-audio-btn').classList.remove('hidden');
+        _updateTonesButtonVisibility();
         updateArrangementSelector();
         updateStatus();
         updateTimeDisplay();
@@ -2500,7 +2570,47 @@ function _buildSaveBody(forceFullSnapshot) {
         },
     };
     if (S.format === 'sloppak' || forceFullSnapshot) {
-        body.arrangements = S.arrangements;
+        // Strip the client-only `_editCount` field from each
+        // arrangement's tones dict so the backend doesn't see it.
+        // Backend reads tones from `body.arrangements[*].tones` here —
+        // a top-level `body.tones` would be ignored, so don't
+        // duplicate the payload.
+        //
+        // Skip `tones` entirely when the arrangement has no net
+        // authored edits this session. Commands that mutate tones
+        // (Add/Move/Remove/Rename) all run `_ensureTones` to
+        // synthesize a `{}` shape; if every edit then gets undone,
+        // the synthesized object stays behind. Shipping it would
+        // overwrite the on-disk `tones: null` sentinel with an
+        // empty `{base, slots, changes, definitions}` dict on the
+        // next sloppak save.
+        body.arrangements = S.arrangements.map(a => {
+            if (!a || !a.tones) return a;
+            // Distinguish loaded-but-unauthored data (ship verbatim,
+            // round-trip through sloppak) from a synthesized-then-
+            // fully-undone state (strip so the backend's preserve
+            // branch fires).
+            //   - Loaded data: `_editCount` key is *absent* (load
+            //     path doesn't set it); ship as-is.
+            //   - Authored this session: `_editCount > 0` → ship.
+            //   - Synthesized + fully undone: `_editCount === 0`
+            //     → strip the field; the empty object would
+            //     otherwise overwrite a `tones: null` sentinel on
+            //     disk.
+            const editCount = a.tones._editCount;
+            if (editCount === 0) {
+                const { tones, ...rest } = a;
+                return rest;
+            }
+            return { ...a, tones: _stripToneInternals(a.tones) };
+        });
+    } else if (_tonesAreDirty(arr)) {
+        // Single-arrangement (PSARC) save — the backend reads
+        // `body.tones` directly. Ship it only when net authored
+        // edits exist this session; a complete undo back to load
+        // state returns the count to 0 → omit the field and let
+        // the backend's preserve-from-disk branch fire.
+        body.tones = _stripToneInternals(arr.tones);
     }
     // Drum-tab payload — separate from arrangements (see sloppak-spec §5.3).
     // S.drumTab is null while the sloppak has none; after +Drums it holds the
@@ -3055,6 +3165,10 @@ window.editorNudgeOffset = (delta) => {
 window.editorSelectArrangement = (val) => {
     S.currentArr = parseInt(val) || 0;
     S.sel.clear();
+    // Tone selection is per-arrangement — clear it so Del after the
+    // switch doesn't remove a same-index marker in the new
+    // arrangement that the user never touched.
+    S.toneSel = null;
     flattenChords();
     if (isKeysMode()) updatePianoRange();
     draw();
@@ -3903,6 +4017,7 @@ window.editorDoCreate = async () => {
         S.offset = data.offset || 0;
         S.currentArr = 0;
         S.sel.clear();
+        S.toneSel = null;
         S.scrollX = 0;
         S.cursorTime = 0;
         S.history = new EditHistory();
@@ -3922,6 +4037,7 @@ window.editorDoCreate = async () => {
         document.getElementById('editor-play-btn').disabled = !data.audio_url;
         document.getElementById('editor-sync-btn').classList.toggle('hidden', !data.audio_url);
         document.getElementById('editor-replace-audio-btn').classList.remove('hidden');
+        _updateTonesButtonVisibility();
         updateArrangementSelector();
         updateStatus();
         updateTimeDisplay();
@@ -3938,6 +4054,14 @@ window.editorDoCreate = async () => {
 
 window.editorBuild = async () => {
     if (!S.sessionId || !S.createMode) return;
+    // PR3c: warn before building when authored tone slots have no
+    // matching gear definition — DLC Builder defaults them to stock
+    // clean in the output PSARC. Confirm prompt lets the user
+    // continue or bail back to the modal to pull definitions in.
+    if (!_editorConfirmToneDefinitions()) {
+        setStatus('Build cancelled');
+        return;
+    }
     setStatus('Building CDLC...');
 
     // Reconstruct chords for ALL arrangements before sending
@@ -3947,7 +4071,17 @@ window.editorBuild = async () => {
         S.currentArr = i;
         reconstructChords();
         const arr = S.arrangements[i];
-        allArrangements.push({
+        // PR3c: include authored tones in the build payload too.
+        // Without this, tones authored on the tone lane / via the
+        // Tones… modal in create mode would silently drop when
+        // building since `editorBuild` doesn't route through
+        // `_buildSaveBody`. Gate on the net-edit counter so a build
+        // after a full undo doesn't ship unchanged tones.
+        let buildTones = null;
+        if (_tonesAreDirty(arr)) {
+            buildTones = _stripToneInternals(arr.tones);
+        }
+        const arrEntry = {
             name: arr.name,
             // Ship tuning + capo so the backend's `_is_extended_range`
             // tuning-length check fires for arrangements where the
@@ -3965,7 +4099,9 @@ window.editorBuild = async () => {
             notes: arr.notes,
             chords: arr.chords,
             chord_templates: arr.chord_templates,
-        });
+        };
+        if (buildTones) arrEntry.tones = buildTones;
+        allArrangements.push(arrEntry);
     }
     S.currentArr = savedArr;
 
@@ -6774,6 +6910,679 @@ if (document.getElementById('editor-canvas')) {
             init();
         }
     }, 100);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Tone lane — PR3c of the tones+notation UI follow-up.
+//
+// Renders tone-change markers on a thin strip at the top of the
+// canvas, lets the user click-to-add / drag-to-move / Del-to-remove
+// markers, and surfaces a Tones… modal for slot renaming + base
+// selection. All edits go through `S.history` so undo/redo works.
+//
+// `TONE_LANE_H`, `_TONE_SLOT_DEFAULTS`, `_TONE_SLOT_COLORS` are
+// declared at the top of this IIFE (alongside `S`) so callsites
+// further down the file resolve them safely.
+// ════════════════════════════════════════════════════════════════════
+
+// Derive a 5-slot list from a raw tones object's `base` + `changes`.
+// Shared between `_readToneSnapshot` (no mutation) and `_ensureTones`
+// (writes back) so they always produce the same ordering. Without
+// this the UI would show `_TONE_SLOT_DEFAULTS` for PSARC loads (where
+// the backend writes `{base, changes, definitions}` without `slots`)
+// and `RenameToneSlotsCmd`'s index-based remap would target the
+// wrong names.
+function _deriveSlots(t) {
+    if (t && Array.isArray(t.slots) && t.slots.length === 5
+            && t.slots.every(s => typeof s === 'string' && s)) {
+        return t.slots.slice();
+    }
+    const seen = new Set();
+    const seeded = [];
+    const consider = name => {
+        if (typeof name === 'string' && name && !seen.has(name)
+                && seeded.length < 5) {
+            seen.add(name);
+            seeded.push(name);
+        }
+    };
+    if (t) consider(t.base);
+    if (t && Array.isArray(t.changes)) {
+        for (const c of t.changes) {
+            if (c && typeof c.name === 'string') consider(c.name);
+        }
+    }
+    for (const name of _TONE_SLOT_DEFAULTS) consider(name);
+    // Pad with synthetic names, looping suffix until we find one that
+    // doesn't collide with already-seeded user names.
+    let synthetic = 1;
+    while (seeded.length < 5) {
+        const candidate = 'Slot ' + synthetic++;
+        if (!seen.has(candidate)) {
+            seen.add(candidate);
+            seeded.push(candidate);
+        }
+    }
+    return seeded.slice(0, 5);
+}
+
+// Read-only projection of an arrangement's tones — returns the
+// authored data when present and a safe default otherwise, WITHOUT
+// mutating `arr`. Use this from display / no-op-compare paths so
+// merely opening the Tones modal doesn't synthesize a `tones` object
+// the sloppak full-snapshot save would then persist to disk.
+function _readToneSnapshot(arr) {
+    const t = (arr && typeof arr.tones === 'object' && arr.tones) || null;
+    const slots = _deriveSlots(t);
+    const baseFromArr = t && typeof t.base === 'string' && t.base;
+    const base = baseFromArr && slots.includes(baseFromArr)
+        ? baseFromArr
+        : slots[0];
+    return {
+        slots,
+        base,
+        changes: Array.isArray(t && t.changes) ? t.changes : [],
+        definitions: Array.isArray(t && t.definitions) ? t.definitions : [],
+    };
+}
+
+function _ensureTones(arr) {
+    if (!arr) return null;
+    if (!arr.tones || typeof arr.tones !== 'object') arr.tones = {};
+    const t = arr.tones;
+    if (!Array.isArray(t.changes)) t.changes = [];
+    if (!Array.isArray(t.definitions)) t.definitions = [];
+    // Reuse `_deriveSlots` so the seeded slot ordering matches what
+    // `_readToneSnapshot` returned to the read-only paths (modal,
+    // context menu, click-to-add). Without that alignment,
+    // `RenameToneSlotsCmd`'s index-based name remap would target a
+    // different slot than the user saw in the UI.
+    t.slots = _deriveSlots(t);
+    if (typeof t.base !== 'string' || !t.slots.includes(t.base)) {
+        t.base = t.slots[0];
+    }
+    return t;
+}
+
+// Track authored tone edits via a per-arrangement counter rather
+// than a sticky boolean. Every mutating command bumps the counter
+// on `exec` and decrements it on `rollback`, so the count returns
+// to 0 after a complete undo to the load state — and `_buildSaveBody`
+// + the Build CDLC warning can skip arrangements where the net
+// authored count is zero.
+//
+// A sticky `_dirty` would cause the editor to ship `<tones>` even
+// after the user undid every edit, silently downgrading what the
+// backend writes for a no-net-change arrangement.
+function _bumpTonesDirty(arr, delta) {
+    if (!arr) return;
+    _ensureTones(arr);
+    const next = (arr.tones._editCount || 0) + delta;
+    arr.tones._editCount = next > 0 ? next : 0;
+}
+function _tonesAreDirty(arr) {
+    return !!(arr && arr.tones && (arr.tones._editCount || 0) > 0);
+}
+
+// Strip client-only fields (`_editCount`, formerly `_dirty`) before
+// shipping `arr.tones` to the backend. Returns a fresh object so we
+// don't mutate the in-memory state.
+function _stripToneInternals(tones) {
+    if (!tones || typeof tones !== 'object') return tones;
+    const { _editCount, _dirty, ...wire } = tones;
+    return wire;
+}
+
+function _currentToneArr() {
+    if (!S.arrangements || !S.arrangements[S.currentArr]) return null;
+    return S.arrangements[S.currentArr];
+}
+
+// ─── Lane drawing ───────────────────────────────────────────────────
+
+function drawToneLane(w) {
+    const arr = _currentToneArr();
+    if (!arr) return;
+    // Don't mutate `arr` from the render path — calling `_ensureTones`
+    // here would silently attach an empty `tones` object to every
+    // PSARC/sloppak just by drawing the canvas, which the Build CDLC
+    // warning would then mistake for authored content. Use
+    // `_readToneSnapshot` so the slot list is derived from
+    // `base + changes[].name` for PSARC loads where `arr.tones.slots`
+    // is absent — markers render with their authored color/label
+    // instead of grey "unknown" until the first mutation.
+    const snap = _readToneSnapshot(arr);
+    const slots = snap.slots;
+    const base = (arr.tones && typeof arr.tones.base === 'string')
+        ? arr.tones.base
+        : '';
+    const changes = snap.changes;
+
+    // Lane background — a darker strip overlaid on the waveform's top
+    // edge so markers stand out against the waveform noise below.
+    ctx.fillStyle = 'rgba(8,8,20,0.85)';
+    ctx.fillRect(0, 0, w, TONE_LANE_H);
+    ctx.strokeStyle = '#1f2937';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, TONE_LANE_H - 0.5);
+    ctx.lineTo(w, TONE_LANE_H - 0.5);
+    ctx.stroke();
+
+    // Base-tone label. Hide entirely when there's no authored tone
+    // data (no base AND no changes) so the lane stays visually empty
+    // for unauthored projects. When changes exist but `base` is empty
+    // (older XML loaded without `<tonebase>`) fall back to the first
+    // slot so the lane still shows *some* base context.
+    // Draw past `LABEL_W` because `drawLabels()` later paints the
+    // 0..LABEL_W strip and would otherwise cover this text with the
+    // waveform's "Audio" label.
+    const effectiveBase = base || (changes.length > 0 ? slots[0] : '');
+    if (effectiveBase) {
+        const baseIdx = slots.indexOf(effectiveBase);
+        ctx.fillStyle = baseIdx >= 0
+            ? _TONE_SLOT_COLORS[baseIdx]
+            : '#94a3b8';
+        ctx.font = 'bold 9px monospace';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('base: ' + effectiveBase, LABEL_W + 4, TONE_LANE_H / 2);
+    }
+
+    // Markers — small filled triangles at each change time, colored
+    // by slot, with the slot name to the right. Selection is tracked
+    // by object ref (`S.toneSel`) rather than index so that
+    // Add/Move/Remove-induced sorts/splices don't shift it onto a
+    // different marker. Clip the marker region to `LABEL_W..w` so a
+    // marker at t==0 (centered at x=LABEL_W) doesn't draw its left
+    // half under the label strip that `drawLabels()` later paints
+    // over.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(LABEL_W, 0, Math.max(0, w - LABEL_W), TONE_LANE_H);
+    ctx.clip();
+    for (let i = 0; i < changes.length; i++) {
+        const c = changes[i];
+        if (typeof c.t !== 'number' || !isFinite(c.t)) continue;
+        const x = timeToX(c.t);
+        if (x < -40 || x > w + 40) continue;
+        const sel = S.toneSel === c;
+        const slotIdx = slots.indexOf(c.name);
+        const color = slotIdx >= 0
+            ? _TONE_SLOT_COLORS[slotIdx]
+            : '#94a3b8';
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(x, 2);
+        ctx.lineTo(x + 5, TONE_LANE_H - 2);
+        ctx.lineTo(x - 5, TONE_LANE_H - 2);
+        ctx.closePath();
+        ctx.fill();
+        if (sel) {
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
+        // Label to the right of the marker.
+        ctx.fillStyle = color;
+        ctx.font = '9px monospace';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(c.name, x + 7, TONE_LANE_H / 2);
+    }
+    ctx.restore();
+}
+
+// Returns the nearest tone-change *ref* under the cursor, or `null`
+// when no marker is in range. Ref-based so callers don't have to
+// re-derive when the changes list re-sorts after a move/add/remove.
+function _hitToneMarker(x) {
+    const arr = _currentToneArr();
+    if (!arr || !arr.tones || !Array.isArray(arr.tones.changes)) return null;
+    const HIT = 7;  // px tolerance around the triangle
+    let best = null, bestDx = Infinity;
+    for (const c of arr.tones.changes) {
+        if (typeof c.t !== 'number' || !isFinite(c.t)) continue;
+        const dx = Math.abs(timeToX(c.t) - x);
+        // Enforce the documented HIT tolerance — without the `<=HIT`
+        // gate, an `Infinity`-seeded `bestDx` would accept any marker
+        // regardless of distance.
+        if (dx <= HIT && dx < bestDx) { best = c; bestDx = dx; }
+    }
+    return best;
+}
+
+// ─── Cmd classes ────────────────────────────────────────────────────
+
+class AddToneChangeCmd {
+    constructor(arrIdx, change) {
+        this.arrIdx = arrIdx; this.change = change;
+    }
+    exec() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        _bumpTonesDirty(arr, +1);
+        const changes = arr.tones.changes;
+        changes.push(this.change);
+        changes.sort((a, b) => a.t - b.t);
+    }
+    rollback() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr || !arr.tones) return;
+        _bumpTonesDirty(arr, -1);
+        const i = arr.tones.changes.indexOf(this.change);
+        if (i >= 0) arr.tones.changes.splice(i, 1);
+    }
+}
+
+class RemoveToneChangeCmd {
+    constructor(arrIdx, change) {
+        this.arrIdx = arrIdx; this.change = change;
+    }
+    exec() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr || !arr.tones) return;
+        _bumpTonesDirty(arr, +1);
+        const i = arr.tones.changes.indexOf(this.change);
+        if (i >= 0) arr.tones.changes.splice(i, 1);
+    }
+    rollback() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        _bumpTonesDirty(arr, -1);
+        const changes = arr.tones.changes;
+        changes.push(this.change);
+        changes.sort((a, b) => a.t - b.t);
+    }
+}
+
+class MoveToneChangeCmd {
+    constructor(arrIdx, change, oldT, newT) {
+        this.arrIdx = arrIdx; this.change = change;
+        this.oldT = oldT; this.newT = newT;
+    }
+    exec() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        _bumpTonesDirty(arr, +1);
+        this.change.t = this.newT;
+        arr.tones.changes.sort((a, b) => a.t - b.t);
+    }
+    rollback() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        _bumpTonesDirty(arr, -1);
+        this.change.t = this.oldT;
+        arr.tones.changes.sort((a, b) => a.t - b.t);
+    }
+}
+
+class RenameToneSlotsCmd {
+    constructor(arrIdx, newSlots, newBase) {
+        this.arrIdx = arrIdx;
+        this.newSlots = newSlots.slice();
+        this.newBase = newBase;
+        this.oldSlots = null;
+        this.oldBase = null;
+    }
+    exec() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr) return;
+        const t = _ensureTones(arr);
+        this.oldSlots = t.slots.slice();
+        this.oldBase = t.base;
+        // Rename placed-change slot references that point at the old
+        // slot names — keeps the lane's existing markers attached to
+        // the renamed slots so they don't orphan to an unknown name.
+        for (const c of t.changes) {
+            const idx = this.oldSlots.indexOf(c.name);
+            if (idx >= 0) c.name = this.newSlots[idx];
+        }
+        // Same for the base name — pick the renamed slot at the old
+        // base's index.
+        const baseIdx = this.oldSlots.indexOf(this.oldBase);
+        t.slots = this.newSlots.slice();
+        // Honor an explicit `newBase` choice; fall back to the
+        // index-preserved rename so the active base survives renames.
+        if (this.newBase && t.slots.includes(this.newBase)) {
+            t.base = this.newBase;
+        } else if (baseIdx >= 0) {
+            t.base = t.slots[baseIdx];
+        } else {
+            t.base = t.slots[0];
+        }
+        _bumpTonesDirty(arr, +1);
+    }
+    rollback() {
+        const arr = S.arrangements[this.arrIdx];
+        if (!arr || !this.oldSlots) return;
+        const t = _ensureTones(arr);
+        for (const c of t.changes) {
+            const idx = this.newSlots.indexOf(c.name);
+            if (idx >= 0) c.name = this.oldSlots[idx];
+        }
+        t.slots = this.oldSlots.slice();
+        t.base = this.oldBase;
+        _bumpTonesDirty(arr, -1);
+    }
+}
+
+// ─── Mouse interactions ─────────────────────────────────────────────
+
+function onToneLaneMouseDown(e, x) {
+    const arr = _currentToneArr();
+    if (!arr) return false;
+    const hit = _hitToneMarker(x);
+    if (hit) {
+        S.toneSel = hit;
+        S.drag = {
+            type: 'tone',
+            startX: x,
+            origT: hit.t,
+            change: hit,
+        };
+        draw();
+        return true;
+    }
+    // Empty area click — place a new change snapped to the grid. The
+    // first add against an unauthored arrangement is what should
+    // synthesise `arr.tones`, and that happens inside
+    // `AddToneChangeCmd.exec` via `_bumpTonesDirty(+1)`. Read via
+    // `_readToneSnapshot` here so the slot lookup doesn't mutate
+    // state for a click outside any marker.
+    const t = snapTime(Math.max(0, xToTime(x)));
+    if (t < 0) return false;
+    const snap = _readToneSnapshot(arr);
+    const nonBase = snap.slots.filter(s => s !== snap.base);
+    // Use a Map so user-controlled slot names like "__proto__" or
+    // "constructor" can't pollute the count lookup via an Object
+    // prototype chain hit.
+    const counts = new Map();
+    for (const s of nonBase) counts.set(s, 0);
+    for (const c of snap.changes) {
+        if (counts.has(c.name)) counts.set(c.name, counts.get(c.name) + 1);
+    }
+    let pick = nonBase[0] || snap.base;
+    let pickCount = Infinity;
+    for (const s of nonBase) {
+        const n = counts.get(s) || 0;
+        if (n < pickCount) { pick = s; pickCount = n; }
+    }
+    const change = { t, name: pick };
+    S.history.exec(new AddToneChangeCmd(S.currentArr, change));
+    S.toneSel = change;
+    draw();
+    return true;
+}
+
+function onToneLaneMouseMove(e, x) {
+    if (!S.drag || S.drag.type !== 'tone') return false;
+    const arr = _currentToneArr();
+    if (!arr) return false;
+    // Snap the drag target so dropped markers land on the same grid
+    // subdivision the rest of the editor uses. Skip the sort during
+    // live drag — the commit on mouseup goes through
+    // `MoveToneChangeCmd` which sorts once, and sorting on every
+    // mousemove was O(n log n) per frame on big arrangements.
+    const newT = snapTime(Math.max(0, xToTime(x)));
+    S.drag.change.t = newT;
+    // Selection is by ref, so the deferred sort doesn't invalidate it.
+    S.toneSel = S.drag.change;
+    draw();
+    return true;
+}
+
+function onToneLaneMouseUp() {
+    if (!S.drag || S.drag.type !== 'tone') return false;
+    const change = S.drag.change;
+    const origT = S.drag.origT;
+    const newT = change.t;
+    S.drag = null;
+    if (origT !== newT) {
+        // The drag mutated `change.t` in-place for live feedback;
+        // replay through the command history so undo/redo can restore
+        // the pre-drag time. Roll back to `origT` first, then `exec()`
+        // applies `newT` and re-sorts.
+        const arr = _currentToneArr();
+        if (arr) {
+            change.t = origT;
+            S.history.exec(new MoveToneChangeCmd(S.currentArr, change, origT, newT));
+        }
+    }
+    draw();
+    return true;
+}
+
+function onToneLaneContextMenu(e, x) {
+    const arr = _currentToneArr();
+    if (!arr) return false;
+    const change = _hitToneMarker(x);
+    if (!change) return false;
+    // Capture the arrangement index NOW. If the user switches
+    // arrangements while the context menu is open, a later
+    // `S.currentArr` read inside the click handlers would dispatch
+    // the command at the wrong arrangement.
+    const menuArrIdx = S.currentArr;
+    // A hit means `arr.tones.changes` already contains this change, so
+    // `arr.tones` is non-null. `arr.tones.slots` / `arr.tones.base`
+    // may still be absent on freshly-loaded data (the load path leaves
+    // slot seeding to first-author), so go through `_readToneSnapshot`
+    // for the slot list to avoid iterating `undefined`.
+    const snap = _readToneSnapshot(arr);
+    // Build the slot-picker via DOM APIs (not `innerHTML`) so a
+    // user-named slot like `<img onerror=…>` can't inject markup
+    // into the menu. The previous `innerHTML` version interpolated
+    // slot names into both an attribute and the button body without
+    // escaping.
+    const menu = document.getElementById('editor-context-menu');
+    menu.replaceChildren();
+
+    const header = document.createElement('div');
+    header.className = 'px-3 py-1 text-[10px] text-gray-500';
+    header.textContent = 'Change slot';
+    menu.appendChild(header);
+
+    for (const slot of snap.slots) {
+        const active = slot === change.name;
+        const btn = document.createElement('button');
+        btn.className = 'w-full text-left px-3 py-1 text-xs hover:bg-dark-500 flex items-center gap-2';
+        const tick = document.createElement('span');
+        tick.className = 'w-3';
+        tick.textContent = active ? '✓' : '';
+        btn.appendChild(tick);
+        btn.appendChild(document.createTextNode(slot));
+        if (slot === snap.base) {
+            const baseTag = document.createElement('span');
+            baseTag.className = 'text-[10px] text-gray-500';
+            baseTag.textContent = ' (base)';
+            btn.appendChild(baseTag);
+        }
+        btn.onclick = () => {
+            hideContextMenu();
+            const oldName = change.name;
+            if (oldName === slot) return;
+            // Slot rename via single-name rebind. Wrap in a command so
+            // undo restores the prior name.
+            S.history.exec({
+                _change: change,
+                _old: oldName,
+                _new: slot,
+                _arr: arr,
+                exec() { this._change.name = this._new; _bumpTonesDirty(this._arr, +1); },
+                rollback() { this._change.name = this._old; _bumpTonesDirty(this._arr, -1); },
+            });
+            draw();
+        };
+        menu.appendChild(btn);
+    }
+
+    const sep = document.createElement('div');
+    sep.className = 'border-t border-gray-700 my-1';
+    menu.appendChild(sep);
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'w-full text-left px-3 py-1 text-xs hover:bg-dark-500 text-rose-300';
+    delBtn.textContent = 'Delete tone change';
+    delBtn.onclick = () => {
+        hideContextMenu();
+        // Use the captured `menuArrIdx` rather than the live
+        // `S.currentArr` so a mid-menu arrangement switch can't
+        // route the delete (and its dirty-counter bump) to the wrong
+        // arrangement.
+        S.history.exec(new RemoveToneChangeCmd(menuArrIdx, change));
+        S.toneSel = null;
+        draw();
+    };
+    menu.appendChild(delBtn);
+
+    menu.style.left = e.clientX + 'px';
+    menu.style.top = e.clientY + 'px';
+    menu.classList.remove('hidden');
+    return true;
+}
+
+// ─── Modal handlers ─────────────────────────────────────────────────
+
+window.editorShowTonesModal = () => {
+    const arr = _currentToneArr();
+    if (!arr) return;
+    // Read-only snapshot — don't synthesize an `arr.tones` just by
+    // opening the modal. Apply path mutates via `RenameToneSlotsCmd`
+    // when the user actually changes something.
+    const t = _readToneSnapshot(arr);
+    const container = document.getElementById('editor-tones-slots');
+    // Build the per-slot rows via DOM APIs (not `innerHTML`) so a
+    // pathological loaded slot name like `"><script>` can't break
+    // out of the value attribute and inject markup.
+    container.replaceChildren();
+    for (let i = 0; i < 5; i++) {
+        const slotName = t.slots[i];
+        const isBase = slotName === t.base;
+        const label = document.createElement('label');
+        label.className = 'flex items-center gap-2';
+
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = 'editor-tones-base';
+        radio.value = String(i);
+        radio.checked = isBase;
+        radio.className = 'text-cyan-500';
+        radio.title = 'Set as base tone';
+        label.appendChild(radio);
+
+        const text = document.createElement('input');
+        text.type = 'text';
+        text.id = 'editor-tones-slot-' + i;
+        text.value = slotName;  // value assignment doesn't parse HTML
+        text.maxLength = 32;
+        text.className = 'flex-1 bg-dark-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 outline-none';
+        label.appendChild(text);
+
+        container.appendChild(label);
+    }
+    document.getElementById('editor-tones-modal').classList.remove('hidden');
+};
+
+window.editorHideTonesModal = () => {
+    document.getElementById('editor-tones-modal').classList.add('hidden');
+};
+
+window.editorApplyTonesModal = () => {
+    const arr = _currentToneArr();
+    if (!arr) return;
+    const newSlots = [];
+    for (let i = 0; i < 5; i++) {
+        const v = (document.getElementById('editor-tones-slot-' + i).value || '').trim();
+        if (!v) {
+            setStatus('Tone slot ' + (i + 1) + ' name cannot be empty');
+            return;
+        }
+        newSlots.push(v);
+    }
+    if (new Set(newSlots).size !== 5) {
+        setStatus('Tone slot names must be unique');
+        return;
+    }
+    const baseIdx = parseInt(
+        (document.querySelector('input[name="editor-tones-base"]:checked') || {}).value || '0',
+        10,
+    );
+    const newBase = newSlots[baseIdx] || newSlots[0];
+    // No-op short-circuit: skip the command (and the dirty bump) when
+    // every slot name + the base match the current state. Read via
+    // `_readToneSnapshot` so the comparison itself doesn't synthesize
+    // a `tones` object on `arr` — that would then leak into the next
+    // sloppak full-snapshot save even after a Cancel-equivalent Apply.
+    const snap = _readToneSnapshot(arr);
+    const slotsUnchanged = newSlots.length === snap.slots.length
+        && newSlots.every((name, i) => name === snap.slots[i]);
+    if (slotsUnchanged && newBase === snap.base) {
+        editorHideTonesModal();
+        return;
+    }
+    S.history.exec(new RenameToneSlotsCmd(S.currentArr, newSlots, newBase));
+    editorHideTonesModal();
+    draw();
+};
+
+// Show the Tones… toolbar button once a song is loaded (matches the
+// reveal pattern of +Drums / +Keys / Strings / Build / Save).
+function _updateTonesButtonVisibility() {
+    const btn = document.getElementById('editor-tones-btn');
+    if (!btn) return;
+    if (S.sessionId) btn.classList.remove('hidden');
+    else btn.classList.add('hidden');
+}
+
+// ─── Build CDLC warning ─────────────────────────────────────────────
+
+// Returns the list of authored tone-slot names that have no matching
+// gear definition in arr.tones.definitions. When the build path
+// proceeds anyway, DLC Builder defaults those slots to stock clean.
+function _undefinedToneSlotNames(arr) {
+    if (!arr || !arr.tones) return [];
+    const t = arr.tones;
+    const usedNames = new Set();
+    if (t.base) usedNames.add(t.base);
+    for (const c of (t.changes || [])) {
+        if (typeof c.name === 'string' && c.name) usedNames.add(c.name);
+    }
+    if (usedNames.size === 0) return [];
+    const defined = new Set();
+    for (const def of (t.definitions || [])) {
+        if (def && typeof def === 'object') {
+            const n = def.Name || def.name || def.Key || def.key;
+            if (typeof n === 'string' && n) defined.add(n);
+        }
+    }
+    return [...usedNames].filter(n => !defined.has(n));
+}
+
+// Returns `true` when the build should proceed, `false` when the user
+// cancelled at the warning prompt. Called from `editorBuild` before
+// the network request. Declared as a plain function inside the
+// module IIFE so the bare-name reference at the callsite resolves
+// through normal lexical scoping (the previous `window.` assignment
+// relied on the browser's global → IIFE fallback, which works but
+// is fragile).
+function _editorConfirmToneDefinitions() {
+    if (!S.arrangements) return true;
+    const missing = new Set();
+    for (const arr of S.arrangements) {
+        // Only warn for arrangements the user has actually authored
+        // tones on this session (net of undos). Without the gate, the
+        // warning would fire on every build of a normal create-mode
+        // song since `_undefinedToneSlotNames` treats an unauthored
+        // "Clean" base (or any unloaded base) as a missing definition.
+        if (!_tonesAreDirty(arr)) continue;
+        for (const name of _undefinedToneSlotNames(arr)) missing.add(name);
+    }
+    if (missing.size === 0) return true;
+    const list = [...missing].sort().join(', ');
+    return window.confirm(
+        'Tone slots without gear definitions:\n  ' + list + '\n\n' +
+        'They will fall back to stock clean in the built PSARC. Continue?',
+    );
 }
 
 })();
